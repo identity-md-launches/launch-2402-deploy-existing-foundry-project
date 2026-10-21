@@ -1,0 +1,6 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+# IdentityMD launches require it: deployed bytecode carries no metadata hash
+bytecode_hash = "none"
