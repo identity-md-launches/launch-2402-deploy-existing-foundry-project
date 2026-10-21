@@ -25,13 +25,21 @@ contract RegistryHandler is Test {
         bytes32 id;
         uint8 kind; // 1 verdict, 2 lead, 3 audit
         uint256 ref; // case, lead or audit id
+        uint16 panel; // the oracle settings the request was asked and paid under
+        uint16 quorum;
+        uint256 key;
     }
+
+    uint16 internal panel = 5;
+    uint16 internal quorum = 4;
+    uint256 internal constant KEY_B = 0xB0B0;
 
     Req[] internal open; // requests nobody has answered or reclaimed
     uint256[] internal leadCase; // lead => case
     bool[] internal leadWaiting; // lead => waiting for the swarm
     uint256[] internal leadStake; // lead => IMD the hunter put down
     address[] internal leadTo; // lead => the hop's target, zero for a page
+    address[] internal leadHunter; // lead => who staked it
     mapping(uint256 => address[]) internal trail; // case => addresses a lead may start from
     mapping(uint256 => uint256) public waitingOf; // case => leads waiting
     mapping(uint256 => uint8) public finalStatus; // case => Confirmed/Rejected once settled, 0 before
@@ -45,6 +53,8 @@ contract RegistryHandler is Test {
     uint256 public ghostRequests; // requests the registry paid the intake for
     uint256 public leadsPaid; // confirmed leads that paid a share
     uint256 public closes; // hunts closed with funds returned
+    uint256 public seatsTaken; // hunts whose seat the opener or the wallet took over
+    uint256 public rotations; // oracle panel or attester changes while requests were in flight
     bool public forgedAccepted;
     bool public closedTooEarly;
     uint256 nonce;
@@ -64,6 +74,9 @@ contract RegistryHandler is Test {
             vm.prank(actors[i]);
             imd.approve(address(reg), type(uint256).max);
         }
+        imd.mint(WALLET, 10_000 ether);
+        vm.prank(WALLET);
+        imd.approve(address(reg), type(uint256).max);
     }
 
     function cases() public view returns (uint256 n) {
@@ -123,7 +136,7 @@ contract RegistryHandler is Test {
                 break;
             }
         }
-        open.push(Req(req, 1, id));
+        open.push(Req(req, 1, id, panel, quorum, attesterKey));
     }
 
     function postBounty(uint256 caseSeed, uint256 actorSeed, uint256 reward, uint16 checks, uint16 days_) external {
@@ -142,11 +155,65 @@ contract RegistryHandler is Test {
         ghostRewardIn += reward;
     }
 
+    /// The case's opener takes the seat from a stranger, or the victim's wallet from anyone; the new hirer tops up.
+    function takeSeat(uint256 caseSeed, bool byWallet, uint256 reward, uint16 days_) external {
+        uint256 n = cases();
+        if (n == 0) return;
+        uint256 id = caseSeed % n;
+        (address hirer,,,,) = reg.hunts(id);
+        (address wallet,, address opener,,,,, LastSeenRegistry.Status s,) = reg.getCase(id);
+        if (hirer == address(0) || s == LastSeenRegistry.Status.Rejected) return;
+        address taker = byWallet ? wallet : opener;
+        if (taker == hirer || (!byWallet && hirer == wallet)) {
+            if (taker != hirer) {
+                vm.prank(taker);
+                vm.expectRevert(LastSeenRegistry.NotHirer.selector);
+                reg.postBounty(id, 0, 0, bytes32(0), 7);
+            }
+            return;
+        }
+        reward = bound(reward, 0, 20 ether);
+        days_ = uint16(bound(days_, 7, 120));
+        vm.prank(taker);
+        reg.postBounty(id, reward, 0, bytes32("taken"), days_);
+        (address now_,,,, bytes32 key) = reg.hunts(id);
+        assertEq(now_, taker);
+        assertEq(key, bytes32("taken"));
+        ghostRewardIn += reward;
+        seatsTaken++;
+    }
+
+    /// A stranger can never take a seat that is already someone's.
+    function strangerTakesSeat(uint256 caseSeed, uint256 actorSeed) external {
+        uint256 n = cases();
+        if (n == 0) return;
+        uint256 id = caseSeed % n;
+        (address hirer,,,,) = reg.hunts(id);
+        (address wallet,, address opener,,,,, LastSeenRegistry.Status s,) = reg.getCase(id);
+        address a = _actor(actorSeed);
+        if (hirer == address(0) || a == hirer || a == opener || a == wallet || s == LastSeenRegistry.Status.Rejected) {
+            return;
+        }
+        vm.prank(a);
+        vm.expectRevert(LastSeenRegistry.NotHirer.selector);
+        reg.postBounty(id, 1 ether, 1, bytes32(0), 30);
+    }
+
+    /// The owner changes the panel or the attester while requests are in flight: each is still judged as asked.
+    function rotate(uint256 seed) external {
+        panel = uint16(5 + seed % 4);
+        quorum = uint16(4 + (seed / 4) % (panel - 3));
+        attesterKey = (seed / 64) % 2 == 0 ? 0xA11CE : KEY_B;
+        reg.setPanel(panel, quorum);
+        reg.setOracle(intake, reg.action(), IERC20(address(imd)), PRICE, vm.addr(attesterKey));
+        if (open.length > 0) rotations++;
+    }
+
     function fundBounty(uint256 caseSeed, uint256 actorSeed, uint256 amount) external {
         uint256 n = cases();
         if (n == 0) return;
         uint256 id = caseSeed % n;
-        (address hirer, uint64 openUntil,,,) = reg.hunts(id);
+        (address hirer, uint256 openUntil,,,) = reg.hunts(id);
         if (hirer == address(0) || block.timestamp > openUntil || _status(id) == LastSeenRegistry.Status.Rejected) {
             return;
         }
@@ -157,7 +224,7 @@ contract RegistryHandler is Test {
     }
 
     function _canLead(uint256 id) internal view returns (bool) {
-        (address hirer, uint64 openUntil,, uint256 checks,) = reg.hunts(id);
+        (address hirer, uint256 openUntil,, uint256 checks,) = reg.hunts(id);
         return hirer != address(0) && block.timestamp <= openUntil && _status(id) != LastSeenRegistry.Status.Rejected
             && checks >= PRICE;
     }
@@ -174,7 +241,7 @@ contract RegistryHandler is Test {
         uint256 before = imd.balanceOf(a);
         vm.prank(a);
         try reg.submitLead(id, from, to) returns (uint256 lead, bytes32 req) {
-            _recordLead(id, lead, req, before - imd.balanceOf(a), to);
+            _recordLead(id, lead, req, before - imd.balanceOf(a), to, a);
         } catch {
             // only a hop already claimed or confirmed for this case is refused here
         }
@@ -190,14 +257,15 @@ contract RegistryHandler is Test {
         uint256 before = imd.balanceOf(a);
         vm.prank(a);
         try reg.submitLink(id, url) returns (uint256 lead, bytes32 req) {
-            _recordLead(id, lead, req, before - imd.balanceOf(a), address(0));
+            _recordLead(id, lead, req, before - imd.balanceOf(a), address(0), a);
         } catch {
             // the page is already waiting or confirmed for this case
         }
     }
 
-    function _recordLead(uint256 id, uint256 lead, bytes32 req, uint256 paid, address to) internal {
+    function _recordLead(uint256 id, uint256 lead, bytes32 req, uint256 paid, address to, address hunter) internal {
         leadTo.push(to);
+        leadHunter.push(hunter);
         assertEq(lead, leadCase.length);
         assertEq(paid, PRICE); // the stake
         leadCase.push(id);
@@ -206,14 +274,14 @@ contract RegistryHandler is Test {
         ghostStakes += paid;
         waitingOf[id]++;
         ghostRequests++;
-        open.push(Req(req, 2, lead));
+        open.push(Req(req, 2, lead, panel, quorum, attesterKey));
     }
 
     function payTip(uint256 caseSeed, uint256 amount, uint256 toSeed) external {
         uint256 n = cases();
         if (n == 0) return;
         uint256 id = caseSeed % n;
-        (address hirer,, uint32 inFlight,,) = reg.hunts(id);
+        (address hirer,, uint256 inFlight,,) = reg.hunts(id);
         uint256 b = _bounty(id);
         if (hirer == address(0) || inFlight != 0 || b == 0) return;
         amount = bound(amount, 1, b);
@@ -226,9 +294,11 @@ contract RegistryHandler is Test {
         uint256 n = cases();
         if (n == 0) return;
         uint256 id = caseSeed % n;
-        (address hirer, uint64 openUntil, uint32 inFlight, uint256 checks,) = reg.hunts(id);
+        (address hirer, uint256 openUntil, uint256 inFlight, uint256 checks,) = reg.hunts(id);
         if (hirer == address(0)) return;
-        if (block.timestamp <= openUntil || inFlight != 0) {
+        // a hunt ends at its end date, or at once when the swarm rejects the case; never with a lead waiting
+        bool rejected = _status(id) == LastSeenRegistry.Status.Rejected;
+        if ((block.timestamp <= openUntil && !rejected) || inFlight != 0) {
             vm.prank(hirer);
             try reg.closeBounty(id) {
                 closedTooEarly = true;
@@ -244,12 +314,22 @@ contract RegistryHandler is Test {
         if (b + checks > 0) closes++;
     }
 
-    function reclaimStake(uint256 leadSeed) external {
+    /// The hunter or the hirer gives up on an unanswered lead; a stranger cannot.
+    function reclaimStake(uint256 leadSeed, uint256 who) external {
         if (leadCase.length == 0) return;
         uint256 lead = leadSeed % leadCase.length;
         if (!leadWaiting[lead]) return;
         vm.warp(block.timestamp + 2 days + 1);
+        address hunter = leadHunter[lead];
+        (address hirer,,,,) = reg.hunts(leadCase[lead]);
+        address stranger = address(0x57A9);
+        vm.prank(stranger);
+        vm.expectRevert(LastSeenRegistry.NotHirer.selector);
         reg.reclaimStake(lead);
+        uint256 before = imd.balanceOf(hunter);
+        vm.prank(who % 2 == 0 ? hunter : hirer);
+        reg.reclaimStake(lead);
+        assertEq(imd.balanceOf(hunter) - before, leadStake[lead]); // the stake goes to the hunter, whoever asks
         _leadDone(lead, true);
     }
 
@@ -263,7 +343,7 @@ contract RegistryHandler is Test {
         assertEq(before - imd.balanceOf(a), PRICE + f);
         ghostPoolIn += f;
         ghostRequests++;
-        open.push(Req(req, 3, aid));
+        open.push(Req(req, 3, aid, panel, quorum, attesterKey));
     }
 
     function reclaimAudit(uint256 seed) external {
@@ -293,10 +373,10 @@ contract RegistryHandler is Test {
         if (open.length == 0) return;
         uint256 i = seed % open.length;
         Req memory r = open[i];
-        OracleAttestation.Attestation memory a = _attestation(r.id, yes);
+        OracleAttestation.Attestation memory a = _attestation(r, yes);
         uint256 caseId = r.kind == 1 ? r.ref : r.kind == 2 ? leadCase[r.ref] : 0;
         uint256 bountyBefore = r.kind == 2 ? _bounty(caseId) : 0;
-        intake.deliver(address(reg), r.id, a, _sign(a, attesterKey));
+        intake.deliver(address(reg), r.id, a, _sign(a, r.key));
         _drop(i);
         if (r.kind == 1) {
             LastSeenRegistry.Status s = _status(caseId);
@@ -320,14 +400,20 @@ contract RegistryHandler is Test {
         }
     }
 
-    /// Answers the registry must refuse: a stranger's key, or (for pinned questions) another question.
-    function forge_(uint256 seed, bool yes, bool wrongKey) external {
+    /// Answers the registry must refuse: a stranger's key, the other attester's key, a panel or quorum below what the
+    /// request asked for, or (for pinned questions) another question.
+    function forge_(uint256 seed, bool yes, uint8 how) external {
         if (open.length == 0) return;
         Req memory r = open[seed % open.length];
-        OracleAttestation.Attestation memory a = _attestation(r.id, yes);
-        if (!wrongKey && r.kind == 1) a.questionHash = keccak256(abi.encode(seed));
-        else wrongKey = true;
-        bytes memory sig = _sign(a, wrongKey ? 0xBAD : attesterKey);
+        OracleAttestation.Attestation memory a = _attestation(r, yes);
+        uint256 key = r.key;
+        how = how % 5;
+        if (how == 0 && r.kind == 1) a.questionHash = keccak256(abi.encode(seed));
+        else if (how == 1) key = r.key == KEY_B ? 0xA11CE : KEY_B; // signed by the attester the request was not asked of
+        else if (how == 2) a.panelSize = r.panel - 1;
+        else if (how == 3) (a.quorum, a.agreed) = (r.quorum - 1, r.quorum - 1);
+        else key = 0xBAD;
+        bytes memory sig = _sign(a, key);
         try intake.deliver(address(reg), r.id, a, sig) {
             forgedAccepted = true;
         } catch {}
@@ -355,20 +441,24 @@ contract RegistryHandler is Test {
         }
     }
 
-    function _attestation(bytes32 req, bool yes) internal returns (OracleAttestation.Attestation memory a) {
+    function _attestation(Req memory r, bool yes) internal returns (OracleAttestation.Attestation memory a) {
         a.requestId = bytes32(++nonce);
         a.chainId = 8453;
-        bytes memory body = intake.bodyOf(req);
-        bytes memory suffix = bytes(',"panelSize":5,"quorum":4,"validForSeconds":86400}');
+        bytes memory body = intake.bodyOf(r.id);
+        bytes memory suffix = bytes(
+            string.concat(
+                ',"panelSize":', vm.toString(r.panel), ',"quorum":', vm.toString(r.quorum), ',"validForSeconds":86400}'
+            )
+        );
         bytes memory members = new bytes(body.length - suffix.length);
         for (uint256 i; i < members.length; i++) {
             members[i] = body[i];
         }
         a.questionHash = keccak256(bytes.concat(members, "}"));
         a.answer = abi.encode(yes);
-        a.panelSize = 5;
-        a.quorum = 4;
-        a.agreed = 5;
+        a.panelSize = r.panel;
+        a.quorum = r.quorum;
+        a.agreed = r.quorum + uint16(nonce % 2); // anywhere from the quorum to one more
         a.issuedAt = uint64(block.timestamp);
         a.expiresAt = uint64(block.timestamp + 1 days);
     }
@@ -396,7 +486,7 @@ contract LastSeenInvariantTest is Test {
         );
         handler.init(reg);
         targetContract(address(handler));
-        bytes4[] memory sel = new bytes4[](20);
+        bytes4[] memory sel = new bytes4[](24);
         sel[0] = RegistryHandler.openCase.selector;
         sel[1] = RegistryHandler.requestVerdict.selector;
         sel[2] = RegistryHandler.postBounty.selector;
@@ -417,6 +507,10 @@ contract LastSeenInvariantTest is Test {
         sel[17] = RegistryHandler.submitLead.selector;
         sel[18] = RegistryHandler.postBounty.selector;
         sel[19] = RegistryHandler.answer.selector;
+        sel[20] = RegistryHandler.takeSeat.selector;
+        sel[21] = RegistryHandler.strangerTakesSeat.selector;
+        sel[22] = RegistryHandler.rotate.selector;
+        sel[23] = RegistryHandler.forge_.selector;
         targetSelector(FuzzSelector(address(handler), sel));
     }
 
@@ -467,7 +561,7 @@ contract LastSeenInvariantTest is Test {
     function invariant_inFlightMatchesWaitingLeads() public view {
         uint256 n = handler.cases();
         for (uint256 i; i < n; i++) {
-            (,, uint32 inFlight,,) = reg.hunts(i);
+            (,, uint256 inFlight,,) = reg.hunts(i);
             assertEq(inFlight, handler.waitingOf(i));
         }
     }

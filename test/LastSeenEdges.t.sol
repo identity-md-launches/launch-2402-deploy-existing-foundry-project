@@ -110,7 +110,7 @@ abstract contract LastSeenFixture is Test {
         (,,, checks,) = reg.hunts(id);
     }
 
-    function _inFlight(uint256 id) internal view returns (uint32 inFlight) {
+    function _inFlight(uint256 id) internal view returns (uint256 inFlight) {
         (,, inFlight,,) = reg.hunts(id);
     }
 
@@ -179,6 +179,11 @@ contract LastSeenEdgesTest is LastSeenFixture {
         reg.openCase(victim, sweeper, 8453, 201, 200);
         vm.expectRevert(LastSeenRegistry.BadInput.selector);
         reg.openCase(victim, sweeper, 0, 100, 200);
+        // a block the oracle cannot carry as a JSON number (above 2^53 - 1) is refused before any price is paid
+        vm.expectRevert(LastSeenRegistry.BadInput.selector);
+        reg.openCase(victim, sweeper, 8453, 100, 9_007_199_254_740_992);
+        vm.expectRevert(LastSeenRegistry.BadInput.selector);
+        reg.openCase(victim, sweeper, 8453, 100, type(uint64).max);
         // the smallest window is one block wide
         uint256 id = reg.openCase(victim, sweeper, 8453, 199, 200);
         assertEq(id, 0);
@@ -186,7 +191,7 @@ contract LastSeenEdgesTest is LastSeenFixture {
 
     function test_openCaseRecordsEverything() public {
         vm.prank(hunter);
-        uint256 id = reg.openCase(victim, sweeper, 4663, 7, type(uint64).max);
+        uint256 id = reg.openCase(victim, sweeper, 4663, 7, 9_007_199_254_740_991); // 2^53 - 1, the largest JSON-safe block
         (
             address wallet,
             address suspect,
@@ -203,7 +208,7 @@ contract LastSeenEdgesTest is LastSeenFixture {
         assertEq(opener, hunter);
         assertEq(chainId, 4663);
         assertEq(fromBlock, 7);
-        assertEq(toBlock, type(uint64).max);
+        assertEq(toBlock, 9_007_199_254_740_991);
         assertEq(askedAt, 0);
         assertEq(uint8(status), uint8(LastSeenRegistry.Status.Open));
         assertEq(bounty, 0);
@@ -230,7 +235,7 @@ contract LastSeenEdgesTest is LastSeenFixture {
         uint64[7] memory chains = [uint64(1), 56, 4663, 8453, 42161, 10, 0];
         uint64 chainId = chains[chainPick % 7];
         bool valid = wallet != address(0) && suspect != address(0) && wallet != suspect && chainPick % 7 < 5
-            && fromBlock < toBlock;
+            && fromBlock < toBlock && toBlock <= 9_007_199_254_740_991;
         if (!valid) vm.expectRevert(LastSeenRegistry.BadInput.selector);
         reg.openCase(wallet, suspect, chainId, fromBlock, toBlock);
         (uint256 cases,,) = reg.counts();
@@ -446,20 +451,32 @@ contract LastSeenEdgesTest is LastSeenFixture {
         assertTrue(reg.flagged(sweeper));
     }
 
-    function test_attesterRotationRefusesTheOldKey() public {
+    /// A request is judged by the attester of the moment it was paid for: a rotation does not strand it, and the
+    /// new key cannot answer it, while every request asked after the rotation needs the new key.
+    function test_attesterRotationAppliesToNewRequestsOnly() public {
         uint256 id = _open();
         bytes32 req = reg.requestVerdict(id);
         OracleAttestation.Attestation memory a = _answer(req, true);
-        bytes memory oldSig = _sign(a);
         reg.setOracle(intake, ACTION, IERC20(address(imd)), PRICE, vm.addr(0xB0B0));
-        vm.expectRevert(LastSeenRegistry.BadAttestation.selector);
-        intake.deliver(address(reg), req, a, oldSig);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xB0B0, _digest(a, address(reg)));
+        vm.expectRevert(LastSeenRegistry.BadAttestation.selector);
         intake.deliver(address(reg), req, a, abi.encodePacked(r, s, v));
+        intake.deliver(address(reg), req, a, _sign(a));
         assertTrue(reg.flagged(sweeper));
+        // a request asked after the rotation refuses the old key and takes the new one
+        uint256 id2 = reg.openCase(victim, deposit, 8453, 100, 200);
+        bytes32 req2 = reg.requestVerdict(id2);
+        OracleAttestation.Attestation memory b = _answer(req2, true);
+        vm.expectRevert(LastSeenRegistry.BadAttestation.selector);
+        intake.deliver(address(reg), req2, b, _sign(b));
+        (v, r, s) = vm.sign(0xB0B0, _digest(b, address(reg)));
+        intake.deliver(address(reg), req2, b, abi.encodePacked(r, s, v));
+        assertTrue(reg.flagged(deposit));
     }
 
-    function test_intakeRotationStrandsOldRequestsUntilRetry() public {
+    /// A request is answered only by the intake it was paid to: after a rotation the old intake still completes
+    /// what it took, the new one cannot answer it, and new requests go to the new one.
+    function test_intakeRotationKeepsOldRequestsWithTheirIntake() public {
         uint256 id = _open();
         bytes32 req = reg.requestVerdict(id);
         MockIntake next = new MockIntake();
@@ -467,14 +484,20 @@ contract LastSeenEdgesTest is LastSeenFixture {
         OracleAttestation.Attestation memory a = _answer(req, true);
         bytes memory sig = _sign(a);
         vm.expectRevert(LastSeenRegistry.NotIntake.selector);
+        next.deliver(address(reg), req, a, sig);
         intake.deliver(address(reg), req, a, sig);
-        vm.warp(block.timestamp + 1 days + 1);
-        bytes32 req2 = reg.requestVerdict(id);
+        assertTrue(reg.flagged(sweeper));
+        // the next request is paid to the new intake, and the old one cannot answer it
+        uint256 id2 = reg.openCase(victim, deposit, 8453, 100, 200);
+        bytes32 req2 = reg.requestVerdict(id2);
         assertEq(next.n(), 1);
         OracleAttestation.Attestation memory b = _answer(req, true);
         b.questionHash = _questionHash(next.bodyOf(req2));
-        next.deliver(address(reg), req2, b, _sign(b));
-        assertTrue(reg.flagged(sweeper));
+        sig = _sign(b);
+        vm.expectRevert(); // the old intake has no such request, or is not the request's intake
+        intake.deliver(address(reg), req2, b, sig);
+        next.deliver(address(reg), req2, b, sig);
+        assertTrue(reg.flagged(deposit));
     }
 
     /// The heaviest callback (a confirmed hop that pays a hunter) fits inside the 200,000 gas the Intake gives it.
@@ -504,7 +527,7 @@ contract LastSeenEdgesTest is LastSeenFixture {
         reg.postBounty(id, 1 ether, 0, 0, 30);
         uint256 t0 = block.timestamp;
         reg.postBounty(id, 1 ether, 1, bytes32("k1"), 7);
-        (address hirer, uint64 openUntil,, uint256 checks, bytes32 tipKey) = reg.hunts(id);
+        (address hirer, uint256 openUntil,, uint256 checks, bytes32 tipKey) = reg.hunts(id);
         assertEq(hirer, address(this));
         assertEq(openUntil, t0 + 7 days);
         assertEq(checks, PRICE);
@@ -597,7 +620,7 @@ contract LastSeenEdgesTest is LastSeenFixture {
         reg.postBounty(id, uint256(reward) % 500 ether, checks, 0, days_);
         if (valid) {
             assertEq(before - imd.balanceOf(address(this)), uint256(reward) % 500 ether + uint256(checks) * PRICE);
-            (, uint64 openUntil,, uint256 c,) = reg.hunts(id);
+            (, uint256 openUntil,, uint256 c,) = reg.hunts(id);
             assertEq(openUntil, block.timestamp + uint256(days_) * 1 days);
             assertEq(c, uint256(checks) * PRICE);
         }
@@ -667,11 +690,15 @@ contract LastSeenEdgesTest is LastSeenFixture {
         vm.expectRevert(LastSeenRegistry.WrongStatus.selector);
         reg.reclaimStake(lead);
         vm.warp(t0 + 2 days + 1);
-        vm.prank(address(0xA77)); // anyone can trigger it; the stake goes to the hunter
+        vm.prank(address(0xA77)); // a stranger cannot give up on someone else's lead
+        vm.expectRevert(LastSeenRegistry.NotHirer.selector);
+        reg.reclaimStake(lead);
+        vm.prank(hunter);
         reg.reclaimStake(lead);
         assertEq(imd.balanceOf(hunter), 10 ether);
         assertEq(_inFlight(id), 0);
         assertEq(_checks(id), PRICE); // the check is spent
+        vm.prank(hunter);
         vm.expectRevert(LastSeenRegistry.WrongStatus.selector);
         reg.reclaimStake(lead);
         // the hop was released: it can be tried again
@@ -888,6 +915,56 @@ contract LastSeenEdgesTest is LastSeenFixture {
         intake.deliver(address(reg), r, a, _sign(a));
         reg.closeBounty(id);
         assertEq(imd.balanceOf(address(reg)), 0);
+    }
+
+    /// A rejected case ends its hunt at once, but still not while a lead is waiting for the swarm.
+    function test_rejectedCaseCloseStillWaitsForLeadsInFlight() public {
+        uint256 id = _open();
+        bytes32 verdict = reg.requestVerdict(id);
+        reg.postBounty(id, 4 ether, 2, 0, 30);
+        vm.prank(hunter);
+        (, bytes32 r) = reg.submitLead(id, sweeper, deposit); // a lead may go in before the verdict
+        _deliver(verdict, false);
+        assertEq(uint8(_status(id)), uint8(LastSeenRegistry.Status.Rejected));
+        vm.expectRevert(LastSeenRegistry.WrongStatus.selector);
+        reg.closeBounty(id);
+        vm.prank(hunter);
+        vm.expectRevert(LastSeenRegistry.NotHirer.selector);
+        reg.closeBounty(id); // and never by anyone but the hirer
+        _deliver(r, false); // the wrong lead's stake becomes a check again
+        uint256 before = imd.balanceOf(address(this));
+        reg.closeBounty(id); // well before the end date
+        assertEq(imd.balanceOf(address(this)), before + 4 ether + 2 * PRICE);
+        assertEq(imd.balanceOf(address(reg)), 0);
+    }
+
+    /// Lowering the panel after a request was asked does not lower what that request's answer must show.
+    function test_loweredPanelDoesNotLowerTheBarForEarlierRequests() public {
+        reg.setPanel(7, 5);
+        uint256 id = _open();
+        bytes32 req = reg.requestVerdict(id);
+        reg.setPanel(5, 4);
+        bytes memory body = intake.bodyOf(req);
+        bytes memory suffix = bytes(',"panelSize":7,"quorum":5,"validForSeconds":86400}');
+        bytes memory members = new bytes(body.length - suffix.length);
+        for (uint256 i; i < members.length; i++) {
+            members[i] = body[i];
+        }
+        OracleAttestation.Attestation memory a = _answer(req, true);
+        a.questionHash = keccak256(bytes.concat(members, "}"));
+        bytes memory sig = _sign(a); // panel 5, quorum 4: today's setting, not what was asked
+        vm.expectRevert(LastSeenRegistry.BadAttestation.selector);
+        intake.deliver(address(reg), req, a, sig);
+        a.panelSize = 7;
+        a.quorum = 4;
+        a.agreed = 7; // a full panel, but a quorum below the one asked
+        sig = _sign(a);
+        vm.expectRevert(LastSeenRegistry.BadAttestation.selector);
+        intake.deliver(address(reg), req, a, sig);
+        a.quorum = 5;
+        a.agreed = 5;
+        intake.deliver(address(reg), req, a, _sign(a));
+        assertTrue(reg.flagged(sweeper));
     }
 
     // ---------------------------------------------------------------- audits
