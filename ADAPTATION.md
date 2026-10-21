@@ -5,8 +5,8 @@ arguments the brief lists (`owner_` = `$owner`, then the Intake, action id, IMD,
 no pool. The constructor arguments, the public read surface used by wallets (`flagged`, `compromised`,
 `auditOf`), every event and every user function keep their names and behaviour, except where a launch rule or
 a reproduced audit finding required a change. Each change is listed below with the file and the reason.
-Tests: `forge test` runs 48 tests (the 20 original, `Bodies.t.sol`, 14 in `test/Adaptation.t.sol` for the first
-round and 13 in `test/Revision.t.sol` for the review round).
+Tests: `forge test` runs 50 tests (the 20 original, `Bodies.t.sol`, 14 in `test/Adaptation.t.sol` for the first
+round and 15 in `test/Revision.t.sol` for the two review rounds).
 
 ## Launch rules
 
@@ -87,12 +87,13 @@ as it arrived and pass now; `.imd-responses.json` answers every finding.
     variant (a stranger's first post goes through, the opener then takes the seat), so `postBounty` now lets an
     empty seat be anyone's, lets the case's opener take it from any stranger and the victim's wallet take it
     from anyone; a stranger can never take it back, and a new hirer never inherits the previous tip key (the
-    key is reset to what they pass, even zero). What the earlier hirer put in (reward, prepaid checks) stays in
-    the hunt, as a donation would. `test_openerAndWalletTakeTheSeatFromAStranger`.
+    key is reset to what they pass, even zero). Revised in the second review round (item 21): the earlier hirer
+    is paid back on a takeover, and the wallet no longer outranks the opener. `test_openerAndWalletTakeTheSeatFromAStranger`.
 14. **Page-lead dedupe keyed on the raw URL (medium).** `LastSeenQuestions.pageKey(url)` (`src/LastSeenQuestions.sol`)
     hashes the URL without its fragment or query string, without trailing slashes and with the host lowercased;
     `build` returns it for kind 3 and `submitLink` keys `_linkUsed` on `(caseId, pageKey)`. The question still
-    carries the URL as given. Paths keep their case. `test_samePageCountsOnceWhateverTheUrlVariant`.
+    carries the URL as given. Paths keep their case. Extended in the second review round (item 22).
+    `test_samePageCountsOnceWhateverTheUrlVariant`.
 15. **Oracle settings checked at settlement, not at ask time (medium).** `Pending` records the intake, attester,
     panel size and quorum of the moment the request was asked and paid for; `onOracleResult` requires
     `msg.sender` to be that intake and `_accept` judges the signer, `panelSize` and `quorum` against the
@@ -119,6 +120,31 @@ as it arrived and pass now; `.imd-responses.json` answers every finding.
     overwritten by a later `NoPowerFound` (`test_canTakeFundsIsNotErasedByALaterNo`); `transferOwnership`
     refuses the zero address (`test_ownershipCannotGoToZero`); `fundBounty` documents that a donation is at the
     hirer's disposal, the finding's own second option.
+
+## Second review round
+
+The reviewer's proof `Proof_4fcf58d27d87` failed on the tree as it arrived and passes now; `.imd-responses.json`
+answers every finding of the round.
+
+21. **Taking over the hirer's seat handed the earlier hirer's deposit to the new one (high, reproduced).** Item
+    13's takeover left the reward and prepaid checks in the hunt, where `payTip` and `closeBounty` put them at the
+    new seat holder's disposal, and the new holder needed to deposit nothing; the wallet outranked everyone though
+    the case's own premise is that its key is the thief's. `postBounty` (`src/LastSeenRegistry.sol`) now: lets
+    the opener or the wallet take the seat only from a hirer who is neither (a stranger), so neither takes it from
+    the other; refuses a takeover while a lead is waiting (`WrongStatus`), so a waiting lead is paid from the
+    reward it was submitted against (the rule of item 4); pays the outgoing hirer the reward and checks left
+    (emitting `BountyClosed`), restarts the end date from the new post, and requires the new hirer to prepay at
+    least one check. The payout is the body of `closeBounty`, moved into an internal `_close` both use; the
+    runtime grew 30 bytes to 24,402. `test_openerAndWalletTakeTheSeatFromAStranger` (changed with the
+    behaviour: the stranger is paid back, the wallet cannot take the seat from the opener),
+    `test_walletTakesTheSeatFromAStrangerButNotTheOpenerFromIt`, `test_seatTakeoverCannotTakeTheEarlierHirersDeposit`.
+22. **Page keys (low, advisory; partly changed).** `LastSeenQuestions.pageKey` also drops a leading `www.` of the
+    host, the default port `:443` and repeated slashes in the path, so `https://www.x.com:443//p` can no longer be
+    paid again as a new page. The query string is still dropped: keeping it would let anyone append `?x=1` and be
+    paid a second time for the same page out of the hirer's reward and checks, which costs more than the false
+    refusal the reviewer found (two pages a forum tells apart only by query string count as one per case). That
+    limit is documented in the README and on `pageKey`. Asserted in `test_samePageCountsOnceWhateverTheUrlVariant`.
+23. **Owner routes funds through `setOracle` (info).** The trust assumption of item 10, unchanged.
 
 ## Findings not changed, and why
 

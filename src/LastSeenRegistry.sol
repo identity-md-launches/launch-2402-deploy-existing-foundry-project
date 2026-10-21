@@ -232,21 +232,32 @@ contract LastSeenRegistry {
 
     /// Hire hunters for a case: `reward` IMD for them, and `checks` swarm judgements paid up front (price each).
     /// One hirer per case; they can top up later. Open for `days_` (7 to 365) from now. An empty seat is anyone's,
-    /// but the case belongs to its opener and to the victim: the opener takes the seat from any stranger, and the
-    /// wallet takes it from anyone, so nobody can squat a victim's hunt. What the earlier hirer put in stays in the hunt.
+    /// but the case belongs to its opener and to its wallet: either takes the seat from a hirer who is neither, so
+    /// nobody can squat a victim's hunt, and neither takes it from the other (the wallet's key may be the thief's).
+    /// A seat changes hands only with no lead waiting, and the earlier hirer gets back what is left of their hunt,
+    /// as closeBounty would pay them: a new hirer starts from their own deposit.
     function postBounty(uint256 caseId, uint256 reward, uint16 checks, bytes32 tipKey, uint16 days_) external {
         Case storage c = _cases[caseId];
         Hunt storage h = hunts[caseId];
         if (c.status == Status.None || c.status == Status.Rejected) revert WrongStatus();
-        if (
-            h.hirer != address(0) && h.hirer != msg.sender && msg.sender != c.wallet
-                && (msg.sender != c.opener || h.hirer == c.wallet)
-        ) revert NotHirer();
-        if (days_ < 7 || days_ > 365 || (h.hirer == address(0) && checks == 0)) revert BadInput();
+        address was = h.hirer;
+        if (was != msg.sender) {
+            if (was != address(0)) {
+                if ((msg.sender != c.opener && msg.sender != c.wallet) || was == c.opener || was == c.wallet) {
+                    revert NotHirer();
+                }
+                _close(caseId, was);
+                h.openUntil = 0;
+            }
+            if (checks == 0) revert BadInput();
+            h.tipKey = tipKey; // a new hirer never inherits a key
+            h.hirer = msg.sender;
+        } else if (tipKey != bytes32(0)) {
+            h.tipKey = tipKey;
+        }
+        if (days_ < 7 || days_ > 365) revert BadInput();
         uint256 fees = uint256(checks) * price;
         _pull(reward + fees);
-        if (tipKey != bytes32(0) || h.hirer != msg.sender) h.tipKey = tipKey; // a new hirer never inherits a key
-        h.hirer = msg.sender;
         h.checks += fees;
         c.bounty += reward;
         uint256 until = block.timestamp + uint256(days_) * 1 days;
@@ -284,10 +295,10 @@ contract LastSeenRegistry {
 
     /// A public page that ties the suspect to an account, an exchange deposit or a person. The swarm reads the page.
     /// The address is whatever the hunter wants paid; post it from a fresh wallet to stay anonymous.
-    /// A page counts once per case whatever fragment, query string, host case or trailing slash the URL carries.
+    /// A page counts once per case whatever fragment, query string, host case, www., :443 or extra slash the URL carries.
     function submitLink(uint256 caseId, string calldata url) external returns (uint256 leadId, bytes32 requestId) {
         Case storage c = _cases[caseId];
-        // refuses an unsafe URL; `page` is the hash of the URL without fragment, query or trailing slash, host lowercased
+        // refuses an unsafe URL; `page` is LastSeenQuestions.pageKey(url)
         (bytes memory body, bytes32 page) = _question(3, c.wallet, c.suspect, c.chainId, c.fromBlock, c.toBlock, url);
         bytes32 k = keccak256(abi.encodePacked(caseId, page));
         if (_linkUsed[k]) revert BadInput();
@@ -313,14 +324,22 @@ contract LastSeenRegistry {
     /// After the hunt's end date, or as soon as the swarm rejects the case, with no lead waiting, the hirer takes
     /// back what is left.
     function closeBounty(uint256 caseId) external {
-        Case storage c = _cases[caseId];
         Hunt storage h = hunts[caseId];
         if (msg.sender != h.hirer) revert NotHirer();
-        if ((block.timestamp <= h.openUntil && c.status != Status.Rejected) || h.inFlight != 0) revert WrongStatus();
+        if (block.timestamp <= h.openUntil && _cases[caseId].status != Status.Rejected) revert WrongStatus();
+        _close(caseId, msg.sender);
+    }
+
+    /// Pays the hirer `to` the reward and prepaid checks left, with no lead waiting: an answer still to come is paid
+    /// from the reward it was submitted against.
+    function _close(uint256 caseId, address to) internal {
+        Case storage c = _cases[caseId];
+        Hunt storage h = hunts[caseId];
+        if (h.inFlight != 0) revert WrongStatus();
         uint256 back = c.bounty + h.checks;
         c.bounty = 0;
         h.checks = 0;
-        if (back > 0) _push(msg.sender, back);
+        if (back > 0) _push(to, back);
         emit BountyClosed(caseId, back);
     }
 

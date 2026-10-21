@@ -118,35 +118,95 @@ contract RevisionTest is Test {
     // ---------------------------------------------------------------- the hirer's seat
 
     /// A stranger (the suspect itself here) can post first, but the opener takes the seat, with their own tip key,
-    /// and the wallet takes it from anyone. What the stranger put in stays in the hunt.
+    /// and the stranger gets back what they put in. Neither the opener nor the wallet takes the seat from the other.
     function test_openerAndWalletTakeTheSeatFromAStranger() public {
         vm.prank(opener);
         uint256 id = reg.openCase(victim, sweeper, 8453, 100, 200);
         vm.prank(sweeper);
         reg.postBounty(id, 1 ether, 1, bytes32("thief key"), 7);
+        assertEq(imd.balanceOf(sweeper), 100 ether - 1 ether - PRICE);
         vm.prank(opener);
         reg.postBounty(id, 10 ether, 4, bytes32("victim key"), 30);
-        (address hirer,,, uint256 checks, bytes32 tipKey) = reg.hunts(id);
+        (address hirer, uint256 openUntil,, uint256 checks, bytes32 tipKey) = reg.hunts(id);
         assertEq(hirer, opener);
         assertEq(tipKey, bytes32("victim key"));
-        assertEq(checks, 5 * PRICE);
-        assertEq(_bounty(id), 11 ether);
+        assertEq(openUntil, block.timestamp + 30 days);
+        assertEq(checks, 4 * PRICE);
+        assertEq(_bounty(id), 10 ether);
+        assertEq(imd.balanceOf(sweeper), 100 ether, "the outgoing hirer is paid back");
+        assertEq(imd.balanceOf(address(reg)), 10 ether + 4 * PRICE);
         // the stranger cannot take it back
         vm.prank(sweeper);
         vm.expectRevert(LastSeenRegistry.NotHirer.selector);
         reg.postBounty(id, 0, 1, bytes32("thief key"), 7);
-        // the victim's wallet outranks the opener; passing no key never inherits the previous hirer's
+        // the victim's wallet does not outrank the opener: its key may be the thief's
         vm.prank(victim);
-        reg.postBounty(id, 0, 1, 0, 7);
-        (hirer,,,, tipKey) = reg.hunts(id);
-        assertEq(hirer, victim);
-        assertEq(tipKey, bytes32(0));
-        vm.prank(opener);
         vm.expectRevert(LastSeenRegistry.NotHirer.selector);
         reg.postBounty(id, 0, 1, 0, 7);
-        // the hirer keeps topping up as before
+        // the hirer keeps topping up as before, without new checks and keeping the key
+        vm.prank(opener);
+        reg.postBounty(id, 1 ether, 0, 0, 7);
+        (,,,, tipKey) = reg.hunts(id);
+        assertEq(tipKey, bytes32("victim key"));
+        assertEq(_bounty(id), 11 ether);
+    }
+
+    /// The wallet takes the seat from a stranger too, with a deposit of its own and never the earlier hirer's key;
+    /// the opener then cannot take it from the wallet.
+    function test_walletTakesTheSeatFromAStrangerButNotTheOpenerFromIt() public {
+        uint256 id = reg.openCase(victim, sweeper, 8453, 100, 200); // opened by this contract
+        vm.prank(stranger);
+        reg.postBounty(id, 5 ether, 2, bytes32("stranger key"), 7);
+        // a new hirer must prepay at least one check
         vm.prank(victim);
-        reg.postBounty(id, 1 ether, 0, bytes32("k"), 7);
+        vm.expectRevert(LastSeenRegistry.BadInput.selector);
+        reg.postBounty(id, 0, 0, 0, 7);
+        vm.prank(victim);
+        reg.postBounty(id, 0, 1, 0, 7);
+        (address hirer,,, uint256 checks, bytes32 tipKey) = reg.hunts(id);
+        assertEq(hirer, victim);
+        assertEq(tipKey, bytes32(0));
+        assertEq(checks, PRICE);
+        assertEq(_bounty(id), 0);
+        assertEq(imd.balanceOf(stranger), 100 ether);
+        vm.expectRevert(LastSeenRegistry.NotHirer.selector);
+        reg.postBounty(id, 0, 1, 0, 7);
+    }
+
+    /// The reviewer's case: the victim hires from a fresh wallet; the thief, holding the compromised wallet's key,
+    /// cannot take the seat, the reward or the checks. And a seat never changes hands under a waiting lead.
+    function test_seatTakeoverCannotTakeTheEarlierHirersDeposit() public {
+        address fresh = address(0xF4E5);
+        imd.mint(fresh, 200 ether);
+        vm.prank(fresh);
+        imd.approve(address(reg), type(uint256).max);
+        vm.prank(fresh);
+        uint256 id = reg.openCase(victim, sweeper, 8453, 100, 200);
+        _deliver(reg.requestVerdict(id), true);
+        vm.prank(fresh);
+        reg.postBounty(id, 100 ether, 4, bytes32("victim key"), 30);
+        vm.startPrank(victim);
+        vm.expectRevert(LastSeenRegistry.NotHirer.selector);
+        reg.postBounty(id, 0, 1, 0, 7);
+        vm.expectRevert(LastSeenRegistry.NotHirer.selector);
+        reg.payTip(id, bytes32("tip"), sweeper, 100 ether);
+        vm.stopPrank();
+
+        // a stranger hires on a case the opener has not hired on; a lead goes in; the opener must wait for it
+        uint256 id2 = reg.openCase(victim, deposit, 8453, 100, 200);
+        _deliver(reg.requestVerdict(id2), true);
+        vm.prank(stranger);
+        reg.postBounty(id2, 8 ether, 2, 0, 30);
+        vm.prank(hunter);
+        (, bytes32 lead) = reg.submitLead(id2, deposit, address(0x4455));
+        vm.expectRevert(LastSeenRegistry.WrongStatus.selector);
+        reg.postBounty(id2, 0, 1, 0, 7);
+        _deliver(lead, true);
+        assertEq(_bounty(id2), 6 ether, "the lead was paid from the reward it was submitted against");
+        uint256 before = imd.balanceOf(stranger);
+        reg.postBounty(id2, 0, 1, 0, 7);
+        assertEq(imd.balanceOf(stranger), before + 6 ether + PRICE, "the stranger gets the reward and check left");
+        assertEq(_bounty(id2), 0);
     }
 
     // ---------------------------------------------------------------- page leads
@@ -176,6 +236,17 @@ contract RevisionTest is Test {
         reg.submitLink(id, "https://x.com/thief/status/2");
         assertEq(questions.pageKey("https://X.com/p/?a=1#b"), questions.pageKey("https://x.com/p"));
         assertTrue(questions.pageKey("https://x.com/P") != questions.pageKey("https://x.com/p")); // paths keep their case
+        // the host's www., the default port and repeated slashes do not make a new page
+        bytes32 p = questions.pageKey("https://x.com/thief/status/1");
+        assertEq(questions.pageKey("https://www.x.com/thief/status/1"), p);
+        assertEq(questions.pageKey("https://WWW.X.com:443/thief/status/1"), p);
+        assertEq(questions.pageKey("https://x.com//thief//status/1//"), p);
+        assertEq(questions.pageKey("https://x.com:443"), questions.pageKey("https://x.com/"));
+        assertTrue(questions.pageKey("https://x.com:8443/thief/status/1") != p);
+        assertTrue(questions.pageKey("https://wwwx.com/thief/status/1") != p);
+        vm.prank(hunter);
+        vm.expectRevert(LastSeenRegistry.BadInput.selector);
+        reg.submitLink(id, "https://www.x.com:443/thief//status/1");
     }
 
     // ---------------------------------------------------------------- settings in flight

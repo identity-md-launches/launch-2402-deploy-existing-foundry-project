@@ -212,8 +212,11 @@ contract LastSeenQuestions {
     }
 
     /// The key under which a page counts once per case: the URL without its fragment or query string, without
-    /// trailing slashes, with the host lowercased. `https://X.com/p/`, `https://x.com/p#a` and `https://x.com/p?s=1`
-    /// all lead the panel to the page `https://x.com/p` and share its key. Paths keep their case.
+    /// trailing or repeated slashes, with the host lowercased and without a leading `www.` or the default `:443`.
+    /// `https://X.com/p/`, `https://x.com/p#a`, `https://x.com/p?s=1`, `https://www.x.com:443//p` all lead the panel
+    /// to the page `https://x.com/p` and share its key. Paths keep their case. The query string is dropped so that
+    /// appending one cannot get the same page paid twice; the cost is that two pages a site tells apart only by
+    /// their query string (`index.php?topic=1`, `?topic=2`) count as one, and the second is refused for that case.
     function pageKey(string calldata url) public pure returns (bytes32) {
         bytes memory u = bytes(url);
         uint256 n = u.length;
@@ -227,14 +230,38 @@ contract LastSeenQuestions {
             n--;
         }
         bytes memory k = new bytes(n);
+        uint256 m;
+        uint256 i;
+        for (; i < n && i < 8; i++) {
+            k[m++] = _lower(u[i]);
+        }
+        if (i + 4 <= n && _lower(u[i]) == "w" && _lower(u[i + 1]) == "w" && _lower(u[i + 2]) == "w" && u[i + 3] == ".") i += 4;
         bool host = true;
-        for (uint256 i; i < n; i++) {
+        for (; i < n; i++) {
             bytes1 ch = u[i];
-            if (i >= 8 && ch == "/") host = false;
-            if (host && ch >= "A" && ch <= "Z") ch = bytes1(uint8(ch) + 32);
-            k[i] = ch;
+            if (ch == "/") {
+                if (!host && k[m - 1] == "/") continue;
+                host = false;
+            } else if (host) {
+                if (
+                    ch == ":" && i + 4 <= n && u[i + 1] == "4" && u[i + 2] == "4" && u[i + 3] == "3"
+                        && (i + 4 == n || u[i + 4] == "/")
+                ) {
+                    i += 3;
+                    continue;
+                }
+                ch = _lower(ch);
+            }
+            k[m++] = ch;
+        }
+        assembly ("memory-safe") {
+            mstore(k, m)
         }
         return keccak256(k);
+    }
+
+    function _lower(bytes1 ch) internal pure returns (bytes1) {
+        return ch >= "A" && ch <= "Z" ? bytes1(uint8(ch) + 32) : ch;
     }
 
     /// https:// followed by 4 to 292 printable characters, none of which could break the JSON the swarm reads.
