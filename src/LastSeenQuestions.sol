@@ -22,7 +22,8 @@ contract LastSeenQuestions {
     error BadInput();
 
     /// The one entry point: `kind` 1 = case verdict (a = wallet, b = suspect), 2 = on-chain hop (a = from, b = to),
-    /// 3 = page lead (a = wallet, b = suspect, url), 4 = audit (b = target). `questionHash` is zero for kinds 3 and 4.
+    /// 3 = page lead (a = wallet, b = suspect, url), 4 = audit (b = target). `questionHash` is zero for kind 4; for
+    /// kind 3 the second value is the page's key instead (`pageKey`), since a relative window cannot be pinned.
     function build(
         uint8 kind,
         address a,
@@ -36,7 +37,7 @@ contract LastSeenQuestions {
     ) external pure returns (bytes memory body, bytes32 questionHash) {
         if (kind == 1) return verdictQuestion(a, b, chainId, fromBlock, toBlock, panelSize, quorum);
         if (kind == 2) return leadQuestion(a, b, chainId, fromBlock, toBlock, panelSize, quorum);
-        if (kind == 3) return (linkBody(a, b, chainId, panelSize, quorum, url), bytes32(0));
+        if (kind == 3) return (linkBody(a, b, chainId, panelSize, quorum, url), pageKey(url));
         return (auditBody(chainId, b, panelSize, quorum), bytes32(0));
     }
 
@@ -57,14 +58,18 @@ contract LastSeenQuestions {
             bytes(uint256(chainId).toString()),
             ',"definitions":{"not counted":"Transactions that ',
             w,
-            ' itself signed and sent.","take":"A token transfer event or native coin movement from ',
+            " itself signed and sent, and movements that ",
+            w,
+            ' authorised with its own signature and another sender only relayed: a user operation (ERC-4337), a permit or Permit2 allowance, a signed order filled by a solver, or a meta-transaction.","take":"A token transfer event or native coin movement from ',
             w
         );
         members = bytes.concat(
             members,
             " to any address, inside a transaction whose sender (tx.from) is ",
             s,
-            '."}',
+            ", that ",
+            w,
+            ' did not authorise."}',
             ',"question":"Within the window, did address ',
             s,
             " take tokens or native coin out of wallet ",
@@ -204,6 +209,32 @@ contract LastSeenQuestions {
             bytes(uint256(quorum).toString()),
             ',"validForSeconds":86400'
         );
+    }
+
+    /// The key under which a page counts once per case: the URL without its fragment or query string, without
+    /// trailing slashes, with the host lowercased. `https://X.com/p/`, `https://x.com/p#a` and `https://x.com/p?s=1`
+    /// all lead the panel to the page `https://x.com/p` and share its key. Paths keep their case.
+    function pageKey(string calldata url) public pure returns (bytes32) {
+        bytes memory u = bytes(url);
+        uint256 n = u.length;
+        for (uint256 i = 8; i < n; i++) {
+            if (u[i] == "?" || u[i] == "#") {
+                n = i;
+                break;
+            }
+        }
+        while (n > 8 && u[n - 1] == "/") {
+            n--;
+        }
+        bytes memory k = new bytes(n);
+        bool host = true;
+        for (uint256 i; i < n; i++) {
+            bytes1 ch = u[i];
+            if (i >= 8 && ch == "/") host = false;
+            if (host && ch >= "A" && ch <= "Z") ch = bytes1(uint8(ch) + 32);
+            k[i] = ch;
+        }
+        return keccak256(k);
     }
 
     /// https:// followed by 4 to 292 printable characters, none of which could break the JSON the swarm reads.
