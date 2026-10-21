@@ -1,0 +1,17 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "LastSeenRegistry",
+      "constructorArgs": [
+        "$owner",
+        "0xa43e6F75ee006411F79Ac1C84120606C2330DE82",
+        "0x6f7261636c652e72657175657374406f7261636c652d31000000000000000000",
+        "0x5F7Bb59365ce557C26dbcAa4EE9d39A4b95B7127",
+        "500000000000000000",
+        "0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982"
+      ]
+    }
+  ],
+  "notes": "LastSeenRegistry on Robinhood Chain provides a public wallet do-not-send list, stolen-funds bounties and paid contract audits using signed IdentityMD oracle answers through Intake. The paying wallet resolves through $owner and controls the oracle settings. Constructor arguments set the approved Intake, action, existing payment asset, price and attester; the initial audit surcharge equals the price. The constructor creates its LastSeenQuestions helper internally. This contracts-only launch creates no token and requires no ETH funding or initialization calls."
+}
