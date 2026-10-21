@@ -5,11 +5,15 @@ import {Test} from "forge-std/Test.sol";
 import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {LastSeenRegistry} from "../src/LastSeenRegistry.sol";
+import {LastSeenQuestions} from "../src/LastSeenQuestions.sol";
 import {IIntake, OracleAttestation} from "../src/IIntake.sol";
 
 contract MockIMD is ERC20 {
     constructor() ERC20("IdentityMD", "IMD") {}
-    function mint(address to, uint256 v) external { _mint(to, v); }
+
+    function mint(address to, uint256 v) external {
+        _mint(to, v);
+    }
 }
 
 /// Stands in for IdentityMD's Intake: takes the payment, remembers the question, and lets the test deliver an answer.
@@ -17,13 +21,22 @@ contract MockIntake is IIntake {
     uint256 public n;
     bytes public lastBody;
     address public lastTarget;
-    function request(bytes32, bytes calldata body, Callback calldata cb, address asset, uint256 amount) external returns (bytes32 id) {
+    mapping(bytes32 => bytes) public bodyOf;
+
+    function request(bytes32, bytes calldata body, Callback calldata cb, address asset, uint256 amount)
+        external
+        returns (bytes32 id)
+    {
         IERC20(asset).transferFrom(msg.sender, address(this), amount);
         lastBody = body;
         lastTarget = cb.target;
         id = keccak256(abi.encode(++n));
+        bodyOf[id] = body;
     }
-    function deliver(address target, bytes32 id, OracleAttestation.Attestation calldata a, bytes calldata sig) external {
+
+    function deliver(address target, bytes32 id, OracleAttestation.Attestation calldata a, bytes calldata sig)
+        external
+    {
         LastSeenRegistry(target).onOracleResult{gas: 200_000}(id, a, sig); // the gas IdentityMD gives a callback
     }
 }
@@ -42,7 +55,9 @@ contract LastSeenRegistryTest is Test {
     function setUp() public {
         imd = new MockIMD();
         intake = new MockIntake();
-        reg = new LastSeenRegistry(address(this), intake, bytes32("oracle.request@oracle-1"), IERC20(address(imd)), PRICE, vm.addr(attesterKey));
+        reg = new LastSeenRegistry(
+            address(this), intake, bytes32("oracle.request@oracle-1"), IERC20(address(imd)), PRICE, vm.addr(attesterKey)
+        );
         imd.mint(address(this), 100 ether);
         imd.mint(hunter, 10 ether);
         imd.approve(address(reg), type(uint256).max);
@@ -51,21 +66,58 @@ contract LastSeenRegistryTest is Test {
     }
 
     // the digest is rebuilt here from the published EIP-712 definition, not borrowed from the contract
-    function _sign(OracleAttestation.Attestation memory a, uint256 key, address verifying) internal view returns (bytes memory) {
-        bytes32 domain = keccak256(abi.encode(
-            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-            keccak256("IdentityMD Oracle"), keccak256("2"), block.chainid, verifying));
-        bytes32 s1 = keccak256(abi.encode(OracleAttestation.TYPEHASH, a.requestId, a.chainId, a.questionHash, a.answerType, keccak256(a.answer), a.figure, a.fromBlock));
-        bytes32 structHash = keccak256(bytes.concat(
-            abi.encode(OracleAttestation.TYPEHASH, a.requestId, a.chainId, a.questionHash, a.answerType, keccak256(a.answer), a.figure, a.fromBlock),
-            abi.encode(a.toBlock, a.blockHash, a.panelJobId, a.panelSize, a.quorum, a.agreed, a.issuedAt, a.expiresAt)));
+    function _sign(OracleAttestation.Attestation memory a, uint256 key, address verifying)
+        internal
+        view
+        returns (bytes memory)
+    {
+        bytes32 domain = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("IdentityMD Oracle"),
+                keccak256("2"),
+                block.chainid,
+                verifying
+            )
+        );
+        bytes32 s1 = keccak256(
+            abi.encode(
+                OracleAttestation.TYPEHASH,
+                a.requestId,
+                a.chainId,
+                a.questionHash,
+                a.answerType,
+                keccak256(a.answer),
+                a.figure,
+                a.fromBlock
+            )
+        );
+        bytes32 structHash = keccak256(
+            bytes.concat(
+                abi.encode(
+                    OracleAttestation.TYPEHASH,
+                    a.requestId,
+                    a.chainId,
+                    a.questionHash,
+                    a.answerType,
+                    keccak256(a.answer),
+                    a.figure,
+                    a.fromBlock
+                ),
+                abi.encode(
+                    a.toBlock, a.blockHash, a.panelJobId, a.panelSize, a.quorum, a.agreed, a.issuedAt, a.expiresAt
+                )
+            )
+        );
         s1;
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, keccak256(abi.encodePacked("\x19\x01", domain, structHash)));
         return abi.encodePacked(r, s, v);
     }
 
-    function _answer(bool yes, uint16 agreed) internal view returns (OracleAttestation.Attestation memory a) {
-        a.requestId = bytes32(uint256(1));
+    uint256 nonce;
+
+    function _answer(bool yes, uint16 agreed) internal returns (OracleAttestation.Attestation memory a) {
+        a.requestId = bytes32(++nonce); // the oracle's own id: each answer is consumed once
         a.chainId = 8453;
         a.answerType = 0;
         a.answer = abi.encode(yes);
@@ -78,6 +130,43 @@ contract LastSeenRegistryTest is Test {
         a.expiresAt = uint64(block.timestamp + 1 days);
     }
 
+    function _body(
+        uint8 kind,
+        address a,
+        address b,
+        uint64 chainId,
+        uint64 fromBlock,
+        uint64 toBlock,
+        string memory url
+    ) internal returns (bytes memory body) {
+        (body,) = new LastSeenQuestions()
+            .build(kind, a, b, chainId, fromBlock, toBlock, reg.panelSize(), reg.quorum(), url);
+    }
+
+    function _caseStatus(uint256 id) internal view returns (LastSeenRegistry.Status status) {
+        (,,,,,,, status,) = reg.getCase(id);
+    }
+
+    function _bounty(uint256 id) internal view returns (uint256 bounty) {
+        (,,,,,,,, bounty) = reg.getCase(id);
+    }
+
+    function _pin(OracleAttestation.Attestation memory a, bytes32 req) internal view {
+        a.questionHash = _questionHash(intake.bodyOf(req));
+    }
+
+    /// The oracle's questionHash for a pinned body: the canonical members, without the panel suffix, closed with "}".
+    /// A page or audit body is not pinned, so whatever this returns for one is accepted.
+    function _questionHash(bytes memory body) internal pure returns (bytes32) {
+        bytes memory suffix = bytes(',"panelSize":5,"quorum":4,"validForSeconds":86400}');
+        if (body.length < suffix.length) return bytes32(0);
+        bytes memory members = new bytes(body.length - suffix.length);
+        for (uint256 i; i < members.length; i++) {
+            members[i] = body[i];
+        }
+        return keccak256(bytes.concat(members, "}"));
+    }
+
     function _openAndAsk() internal returns (uint256 id, bytes32 req) {
         id = reg.openCase(victim, sweeper, 8453, 100, 200);
         req = reg.requestVerdict(id);
@@ -86,18 +175,20 @@ contract LastSeenRegistryTest is Test {
     function test_confirmedVerdictFlagsBoth() public {
         (uint256 id, bytes32 req) = _openAndAsk();
         OracleAttestation.Attestation memory a = _answer(true, 5);
+        _pin(a, req);
         intake.deliver(address(reg), req, a, _sign(a, attesterKey, address(reg)));
         assertTrue(reg.flagged(sweeper));
         assertTrue(reg.compromised(victim));
-        assertEq(uint8(reg.getCase(id).status), uint8(LastSeenRegistry.Status.Confirmed));
+        assertEq(uint8(_caseStatus(id)), uint8(LastSeenRegistry.Status.Confirmed));
     }
 
     function test_noMeansNoFlag() public {
         (uint256 id, bytes32 req) = _openAndAsk();
         OracleAttestation.Attestation memory a = _answer(false, 5);
+        _pin(a, req);
         intake.deliver(address(reg), req, a, _sign(a, attesterKey, address(reg)));
         assertFalse(reg.flagged(sweeper));
-        assertEq(uint8(reg.getCase(id).status), uint8(LastSeenRegistry.Status.Rejected));
+        assertEq(uint8(_caseStatus(id)), uint8(LastSeenRegistry.Status.Rejected));
     }
 
     function test_wrongSignerRejected() public {
@@ -135,6 +226,7 @@ contract LastSeenRegistryTest is Test {
     function test_answerCannotBeReplayed() public {
         (, bytes32 req) = _openAndAsk();
         OracleAttestation.Attestation memory a = _answer(true, 5);
+        _pin(a, req);
         bytes memory sig = _sign(a, attesterKey, address(reg));
         intake.deliver(address(reg), req, a, sig);
         vm.expectRevert(LastSeenRegistry.UnknownRequest.selector);
@@ -156,11 +248,13 @@ contract LastSeenRegistryTest is Test {
         bytes32 req;
         (id, req) = _openAndAsk();
         a = _answer(true, 5);
+        _pin(a, req);
         intake.deliver(address(reg), req, a, _sign(a, attesterKey, address(reg)));
     }
 
     function _deliver(bytes32 req, bool yes) internal {
         OracleAttestation.Attestation memory a = _answer(yes, 5);
+        _pin(a, req);
         intake.deliver(address(reg), req, a, _sign(a, attesterKey, address(reg)));
     }
 
@@ -188,7 +282,7 @@ contract LastSeenRegistryTest is Test {
         (, bytes32 r2) = reg.submitLead(id, hop, deposit);
         _deliver(r2, true);
         assertEq(imd.balanceOf(hunter), afterFirst + 1.5 ether); // a quarter of the 6 left
-        assertEq(reg.getCase(id).bounty, 4.5 ether);
+        assertEq(_bounty(id), 4.5 ether);
         (,,, checks,) = reg.hunts(id);
         assertEq(checks, 2 * PRICE); // the hirer paid for the two checks
     }
@@ -202,7 +296,7 @@ contract LastSeenRegistryTest is Test {
         assertEq(imd.balanceOf(hunter), 10 ether - PRICE);
         (,,, uint256 checks,) = reg.hunts(id);
         assertEq(checks, PRICE); // the stake refilled the hirer's prepaid check
-        assertEq(reg.getCase(id).bounty, 4 ether);
+        assertEq(_bounty(id), 4 ether);
         // the same hop can be tried again, by anyone
         vm.prank(hunter);
         reg.submitLead(id, sweeper, deposit);
@@ -293,21 +387,22 @@ contract LastSeenRegistryTest is Test {
         (uint256 aid, bytes32 r) = reg.requestAudit(8453, token);
         assertEq(reg.pool(), PRICE); // the audit fee
         assertEq(uint8(reg.auditOf(8453, token)), uint8(LastSeenRegistry.Finding.Asked));
-        string memory body = reg.auditBody(8453, token);
-        assertEq(keccak256(intake.lastBody()), keccak256(bytes(body)));
+        bytes memory body = _body(4, address(0), token, 8453, 0, 0, "");
+        assertEq(keccak256(intake.lastBody()), keccak256(body));
         _deliver(r, true);
         assertEq(uint8(reg.auditOf(8453, token)), uint8(LastSeenRegistry.Finding.CanTakeFunds));
-        assertEq(uint8(reg.getAudit(aid).finding), uint8(LastSeenRegistry.Finding.CanTakeFunds));
+        aid;
         vm.expectRevert(LastSeenRegistry.BadInput.selector);
         reg.requestAudit(10, token);
     }
 
     function test_bodyIsValidJsonShape() public {
         (uint256 id,) = _openAndAsk();
-        string memory body = reg.verdictBody(id);
-        assertEq(bytes(body)[0], bytes1("{"));
-        assertEq(bytes(body)[bytes(body).length - 1], bytes1("}"));
-        assertEq(keccak256(intake.lastBody()), keccak256(bytes(body)));
+        bytes memory body = _body(1, victim, sweeper, 8453, 100, 200, "");
+        assertEq(body[0], bytes1("{"));
+        assertEq(body[body.length - 1], bytes1("}"));
+        assertEq(keccak256(intake.lastBody()), keccak256(body));
+        id;
         assertEq(intake.lastTarget(), address(reg));
     }
 

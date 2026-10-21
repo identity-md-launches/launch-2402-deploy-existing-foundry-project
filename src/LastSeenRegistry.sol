@@ -3,11 +3,8 @@ pragma solidity ^0.8.24;
 
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
-import {EIP712} from "openzeppelin-contracts/contracts/utils/cryptography/EIP712.sol";
-import {ECDSA} from "openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol";
-import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
-import {Strings} from "openzeppelin-contracts/contracts/utils/Strings.sol";
 import {IIntake, OracleAttestation} from "./IIntake.sol";
+import {LastSeenQuestions} from "./LastSeenQuestions.sol";
 
 /// @title LastSeenRegistry
 /// @notice A public "do not send" list for crypto wallets, a bounty hunt for stolen funds, and contract audits,
@@ -28,41 +25,57 @@ import {IIntake, OracleAttestation} from "./IIntake.sol";
 ///    victims' verdicts.
 ///
 /// Wallets, apps and exchanges read `flagged`, `compromised` and `auditOf` for free before they send anything.
-contract LastSeenRegistry is EIP712, Ownable {
+///
+/// Trust assumption: the owner sets the oracle connection (intake, action, asset, price, attester), as the IdentityMD
+/// oracle skill requires so a new oracle version needs no redeploy. Whoever holds the owner key therefore decides
+/// which signer's answers count, and with that every verdict, lead payout and audit finding. The owner has no
+/// function that withdraws the pool, rewards, prepaid checks or stakes directly.
+contract LastSeenRegistry {
     using SafeERC20 for IERC20;
-    using Strings for address;
-    using Strings for uint256;
 
-    enum Status { None, Open, Asked, Confirmed, Rejected, NoAnswer }
-    enum Finding { None, Asked, NoPowerFound, CanTakeFunds }
+    enum Status {
+        None,
+        Open,
+        Asked,
+        Confirmed,
+        Rejected,
+        NoAnswer
+    }
+    enum Finding {
+        None,
+        Asked,
+        NoPowerFound,
+        CanTakeFunds,
+        NoAnswer
+    }
 
     struct Case {
-        address wallet;     // the victim's wallet
-        address suspect;    // the address said to be taking funds out of it
+        address wallet; // the victim's wallet
+        address suspect; // the address said to be taking funds out of it
         address opener;
-        uint64 chainId;     // where it happened
+        uint64 chainId; // where it happened
         uint64 fromBlock;
         uint64 toBlock;
         uint64 askedAt;
         Status status;
-        uint256 bounty;     // IMD reward left for hunters
+        uint256 bounty; // IMD reward left for hunters
     }
 
     struct Hunt {
-        address hirer;      // who posted the bounty; only they can pay private tips or close it
+        address hirer; // who posted the bounty; only they can pay private tips or close it
         uint64 openUntil;
-        uint32 inFlight;    // leads waiting for the swarm
-        uint256 checks;     // IMD the hirer prepaid so the swarm can judge leads
-        bytes32 tipKey;     // sha-256 of the hirer's public key; private tips are encrypted to it before they leave the hunter's browser
+        uint32 inFlight; // leads waiting for the swarm
+        uint256 checks; // IMD the hirer prepaid so the swarm can judge leads
+        bytes32 tipKey; // sha-256 of the hirer's public key; private tips are encrypted to it before they leave the hunter's browser
     }
 
     struct Lead {
         uint256 caseId;
-        address from;       // on-chain hop: the suspect, or an address an earlier confirmed lead reached
-        address to;         // on-chain hop: where the hunter says the funds went next; zero for a link
-        address hunter;     // any address the hunter chooses; nothing ties it to a person
+        address from; // on-chain hop: the suspect, or an address an earlier confirmed lead reached
+        address to; // on-chain hop: where the hunter says the funds went next; zero for a link
+        address hunter; // any address the hunter chooses; nothing ties it to a person
         Status status;
-        uint8 kind;         // 1 = on-chain hop, 2 = public page
+        uint8 kind; // 1 = on-chain hop, 2 = public page
         uint64 askedAt;
     }
 
@@ -74,9 +87,22 @@ contract LastSeenRegistry is EIP712, Ownable {
     }
 
     struct Pending {
-        uint8 kind;         // 1 = case verdict, 2 = lead, 3 = audit
+        uint8 kind; // 1 = case verdict, 2 = lead, 3 = audit
+        uint64 askedAt;
         uint256 id;
+        bytes32 questionHash; // what the oracle must sign for the answer to count; zero when the question cannot be pinned
     }
+
+    bytes32 internal constant DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 internal constant NAME_HASH = keccak256("IdentityMD Oracle");
+    bytes32 internal constant VERSION_HASH = keccak256("2");
+
+    /// The question texts, built outside this contract so its runtime stays under EIP-170.
+    LastSeenQuestions internal immutable questions;
+
+    /// The owner: a constructor argument, never the deployer. Sets the oracle connection, the fee, the chains and the panel.
+    address public owner;
 
     // the oracle connection: owner settings, so a new oracle version needs no redeploy
     IIntake public intake;
@@ -86,49 +112,66 @@ contract LastSeenRegistry is EIP712, Ownable {
     address public attester;
     uint16 public panelSize = 5;
     uint16 public quorum = 4;
-    uint256 public auditFee;  // on top of the swarm's price; goes to the pool
+    uint256 public auditFee; // on top of the swarm's price; goes to the pool
 
-    uint256 public pool;     // IMD anyone can donate so that verdicts are free for victims
+    uint256 public pool; // IMD anyone can donate so that verdicts are free for victims
     // chains the oracle can read evidence on; a question about any other chain is refused and the 0.5 IMD is lost
     mapping(uint64 => bool) public supportedChain;
     Case[] internal _cases;
     Lead[] internal _leads;
     Audit[] internal _audits;
     mapping(uint256 => Hunt) public hunts;
-    mapping(bytes32 => Pending) public pending;
-    mapping(address => bool) public flagged;      // confirmed to take funds from other people's wallets
-    mapping(address => bool) public compromised;  // confirmed to have a key in someone else's hands
+    mapping(bytes32 => Pending) internal pending;
+    mapping(uint256 => bytes32) internal _caseRequest; // case => the one request id whose answer may settle it
+    mapping(address => bool) public flagged; // confirmed to take funds from other people's wallets
+    mapping(address => bool) public compromised; // confirmed to have a key in someone else's hands
     mapping(uint256 => mapping(address => bool)) public reached; // case => addresses the confirmed trail has reached
     mapping(uint256 => mapping(address => bool)) internal _claimed; // case => hop targets already confirmed or waiting
     mapping(bytes32 => bool) internal _linkUsed;
+    mapping(uint256 => bytes32) internal _linkKey; // page lead => its _linkUsed key, released when it fails or goes unanswered
     mapping(uint64 => mapping(address => Finding)) public auditOf; // chain => contract => the swarm's latest finding
-    mapping(uint256 => uint256) internal _stake;  // lead => IMD the hunter put down
+    mapping(uint256 => uint256) internal _stake; // lead => IMD the hunter put down
 
-    event CaseOpened(uint256 indexed caseId, address indexed wallet, address indexed suspect, uint64 chainId, uint64 fromBlock, uint64 toBlock);
+    event CaseOpened(
+        uint256 indexed caseId,
+        address indexed wallet,
+        address indexed suspect,
+        uint64 chainId,
+        uint64 fromBlock,
+        uint64 toBlock
+    );
     event VerdictAsked(uint256 indexed caseId, bytes32 requestId, bool fromPool);
     event Verdict(uint256 indexed caseId, bool confirmed, bytes32 oracleRequestId, uint16 agreed, uint16 panel);
-    event BountyPosted(uint256 indexed caseId, address indexed hirer, uint256 reward, uint256 checks, uint64 openUntil, bytes32 tipKey);
+    event BountyPosted(
+        uint256 indexed caseId, address indexed hirer, uint256 reward, uint256 checks, uint64 openUntil, bytes32 tipKey
+    );
     event BountyFunded(uint256 indexed caseId, uint256 amount, uint256 total);
     event BountyClosed(uint256 indexed caseId, uint256 returned);
-    event LeadSubmitted(uint256 indexed leadId, uint256 indexed caseId, address from, address to, address hunter, bytes32 requestId);
+    event LeadSubmitted(
+        uint256 indexed leadId, uint256 indexed caseId, address from, address to, address hunter, bytes32 requestId
+    );
     event LinkSubmitted(uint256 indexed leadId, uint256 indexed caseId, string url, address hunter, bytes32 requestId);
     event LeadVerdict(uint256 indexed leadId, bool confirmed, uint256 paid);
     event TipPaid(uint256 indexed caseId, bytes32 indexed tipId, address to, uint256 amount);
     event AuditAsked(uint256 indexed auditId, uint64 chainId, address indexed target, address asker, bytes32 requestId);
     event AuditResult(uint256 indexed auditId, bool canTakeFunds, uint16 agreed, uint16 panel);
+    event AuditUnanswered(uint256 indexed auditId, bytes32 requestId);
     event PoolFunded(address indexed from, uint256 amount, uint256 total);
 
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
     error BadInput();
+    error NotOwner();
     error WrongStatus();
     error NotIntake();
     error NotHirer();
     error UnknownRequest();
     error BadAttestation();
 
-    constructor(address owner_, IIntake intake_, bytes32 action_, IERC20 asset_, uint256 price_, address attester_)
-        EIP712("IdentityMD Oracle", "2")
-        Ownable(owner_)
-    {
+    constructor(address owner_, IIntake intake_, bytes32 action_, IERC20 asset_, uint256 price_, address attester_) {
+        if (owner_ == address(0)) revert BadInput();
+        owner = owner_;
+        questions = new LastSeenQuestions();
         intake = intake_;
         action = action_;
         asset = asset_;
@@ -136,27 +179,45 @@ contract LastSeenRegistry is EIP712, Ownable {
         attester = attester_;
         auditFee = price_;
         uint64[5] memory ids = [uint64(1), 56, 4663, 8453, 42161];
-        for (uint256 i; i < ids.length; i++) supportedChain[ids[i]] = true;
+        for (uint256 i; i < ids.length; i++) {
+            supportedChain[ids[i]] = true;
+        }
     }
 
     // ---------------------------------------------------------------- cases
 
-    function openCase(address wallet, address suspect, uint64 chainId, uint64 fromBlock, uint64 toBlock) external returns (uint256 id) {
-        if (wallet == address(0) || suspect == address(0) || wallet == suspect || !supportedChain[chainId] || fromBlock >= toBlock) revert BadInput();
+    function openCase(address wallet, address suspect, uint64 chainId, uint64 fromBlock, uint64 toBlock)
+        external
+        returns (uint256 id)
+    {
+        if (
+            wallet == address(0) || suspect == address(0) || wallet == suspect || !supportedChain[chainId]
+                || fromBlock >= toBlock
+        ) revert BadInput();
         id = _cases.length;
-        _cases.push(Case(wallet, suspect, msg.sender, chainId, fromBlock, toBlock, 0, Status.Open, 0));
+        Case storage c = _cases.push();
+        c.wallet = wallet;
+        c.suspect = suspect;
+        c.opener = msg.sender;
+        c.chainId = chainId;
+        c.fromBlock = fromBlock;
+        c.toBlock = toBlock;
+        c.status = Status.Open;
         emit CaseOpened(id, wallet, suspect, chainId, fromBlock, toBlock);
     }
 
     /// Ask the swarm whether the case is true. Paid from the pool when it can cover it, otherwise by the caller.
-    /// A case can be asked again if the last answer never arrived (after a day) or the panel could not agree.
+    /// A case can be asked again if the last answer never arrived (after a day); the earlier request then no longer counts.
     function requestVerdict(uint256 caseId) external returns (bytes32 requestId) {
         Case storage c = _cases[caseId];
-        bool retry = c.status == Status.NoAnswer || (c.status == Status.Asked && block.timestamp > c.askedAt + 1 days);
+        bool retry = c.status == Status.Asked && block.timestamp > c.askedAt + 1 days;
         if (c.status != Status.Open && !retry) revert WrongStatus();
         bool fromPool = _pay();
-        requestId = _ask(_verdictBody(c));
-        pending[requestId] = Pending(1, caseId);
+        (bytes memory body, bytes32 questionHash) =
+            _question(1, c.wallet, c.suspect, c.chainId, c.fromBlock, c.toBlock, "");
+        delete pending[_caseRequest[caseId]]; // a stale answer to the earlier ask must not settle the case
+        requestId = _ask(1, caseId, body, questionHash);
+        _caseRequest[caseId] = requestId;
         c.status = Status.Asked;
         c.askedAt = uint64(block.timestamp);
         emit VerdictAsked(caseId, requestId, fromPool);
@@ -183,10 +244,13 @@ contract LastSeenRegistry is EIP712, Ownable {
         emit BountyPosted(caseId, msg.sender, c.bounty, h.checks, h.openUntil, h.tipKey);
     }
 
-    /// Anyone can add to the reward of a case that has a hunt.
+    /// Anyone can add to the reward of a case that has a hunt still open.
     function fundBounty(uint256 caseId, uint256 amount) external {
         Case storage c = _cases[caseId];
-        if (hunts[caseId].hirer == address(0) || c.status == Status.Rejected || amount == 0) revert WrongStatus();
+        Hunt storage h = hunts[caseId];
+        if (h.hirer == address(0) || block.timestamp > h.openUntil || c.status == Status.Rejected || amount == 0) {
+            revert WrongStatus();
+        }
         asset.safeTransferFrom(msg.sender, address(this), amount);
         c.bounty += amount;
         emit BountyFunded(caseId, amount, c.bounty);
@@ -195,10 +259,13 @@ contract LastSeenRegistry is EIP712, Ownable {
     /// An on-chain lead: funds went from `from` to `to`. `from` must be the suspect or an address the confirmed trail reached.
     function submitLead(uint256 caseId, address from, address to) external returns (uint256 leadId, bytes32 requestId) {
         Case storage c = _cases[caseId];
-        if (to == address(0) || to == from || _claimed[caseId][to] || (from != c.suspect && !reached[caseId][from])) revert BadInput();
+        if (to == address(0) || to == from || _claimed[caseId][to] || (from != c.suspect && !reached[caseId][from])) {
+            revert BadInput();
+        }
         _claimed[caseId][to] = true;
         leadId = _newLead(caseId, from, to, 1);
-        requestId = _askForHunt(leadId, _leadBody(c, from, to));
+        (bytes memory body, bytes32 questionHash) = _question(2, from, to, c.chainId, c.fromBlock, c.toBlock, "");
+        requestId = _ask(2, leadId, body, questionHash);
         emit LeadSubmitted(leadId, caseId, from, to, msg.sender, requestId);
     }
 
@@ -206,17 +273,22 @@ contract LastSeenRegistry is EIP712, Ownable {
     /// The address is whatever the hunter wants paid; post it from a fresh wallet to stay anonymous.
     function submitLink(uint256 caseId, string calldata url) external returns (uint256 leadId, bytes32 requestId) {
         bytes32 k = keccak256(abi.encodePacked(caseId, url));
-        if (!_safeUrl(bytes(url)) || _linkUsed[k]) revert BadInput();
+        if (_linkUsed[k]) revert BadInput();
         _linkUsed[k] = true;
+        Case storage c = _cases[caseId];
+        (bytes memory body,) = _question(3, c.wallet, c.suspect, c.chainId, c.fromBlock, c.toBlock, url); // refuses an unsafe URL
         leadId = _newLead(caseId, address(0), address(0), 2);
-        requestId = _askForHunt(leadId, _linkBody(_cases[caseId], url));
+        _linkKey[leadId] = k;
+        requestId = _ask(2, leadId, body, bytes32(0));
         emit LinkSubmitted(leadId, caseId, url, msg.sender, requestId);
     }
 
     /// For a private tip the swarm cannot check: the hirer reads it and pays from the reward directly.
+    /// Not while a lead is waiting for the swarm: a confirmed lead is paid from the reward that was posted when it went in.
     function payTip(uint256 caseId, bytes32 tipId, address to, uint256 amount) external {
         Case storage c = _cases[caseId];
         if (msg.sender != hunts[caseId].hirer) revert NotHirer();
+        if (hunts[caseId].inFlight != 0) revert WrongStatus();
         if (to == address(0) || amount == 0 || amount > c.bounty) revert BadInput();
         c.bounty -= amount;
         asset.safeTransfer(to, amount);
@@ -242,7 +314,7 @@ contract LastSeenRegistry is EIP712, Ownable {
         if (l.status != Status.Asked || block.timestamp <= l.askedAt + 2 days) revert WrongStatus();
         l.status = Status.NoAnswer;
         hunts[l.caseId].inFlight--;
-        if (l.kind == 1) _claimed[l.caseId][l.to] = false;
+        _release(leadId);
         uint256 s = _stake[leadId];
         _stake[leadId] = 0;
         asset.safeTransfer(l.hunter, s);
@@ -251,18 +323,29 @@ contract LastSeenRegistry is EIP712, Ownable {
     function _newLead(uint256 caseId, address from, address to, uint8 kind) internal returns (uint256 leadId) {
         Case storage c = _cases[caseId];
         Hunt storage h = hunts[caseId];
-        if (h.hirer == address(0) || block.timestamp > h.openUntil || c.status == Status.Rejected || h.checks < price) revert WrongStatus();
+        if (h.hirer == address(0) || block.timestamp > h.openUntil || c.status == Status.Rejected || h.checks < price) {
+            revert WrongStatus();
+        }
         asset.safeTransferFrom(msg.sender, address(this), price); // the stake
         leadId = _leads.length;
-        _leads.push(Lead(caseId, from, to, msg.sender, Status.Asked, kind, uint64(block.timestamp)));
+        Lead storage l = _leads.push();
+        l.caseId = caseId;
+        l.from = from;
+        l.to = to;
+        l.hunter = msg.sender;
+        l.status = Status.Asked;
+        l.kind = kind;
+        l.askedAt = uint64(block.timestamp);
         _stake[leadId] = price;
         h.checks -= price;
         h.inFlight++;
     }
 
-    function _askForHunt(uint256 leadId, bytes memory body) internal returns (bytes32 requestId) {
-        requestId = _ask(body);
-        pending[requestId] = Pending(2, leadId);
+    /// A hop or page that was wrong or never judged can be submitted again.
+    function _release(uint256 leadId) internal {
+        Lead storage l = _leads[leadId];
+        if (l.kind == 1) _claimed[l.caseId][l.to] = false;
+        else _linkUsed[_linkKey[leadId]] = false;
     }
 
     // ---------------------------------------------------------------- the audit
@@ -276,37 +359,61 @@ contract LastSeenRegistry is EIP712, Ownable {
             emit PoolFunded(msg.sender, auditFee, pool);
         }
         auditId = _audits.length;
-        _audits.push(Audit(target, chainId, msg.sender, Finding.Asked));
+        Audit storage au = _audits.push();
+        au.target = target;
+        au.chainId = chainId;
+        au.asker = msg.sender;
+        au.finding = Finding.Asked;
         if (auditOf[chainId][target] == Finding.None) auditOf[chainId][target] = Finding.Asked;
-        requestId = _ask(_auditBody(chainId, target));
-        pending[requestId] = Pending(3, auditId);
+        (bytes memory body,) = _question(4, address(0), target, chainId, 0, 0, "");
+        requestId = _ask(3, auditId, body, bytes32(0));
         emit AuditAsked(auditId, chainId, target, msg.sender, requestId);
+    }
+
+    /// If the swarm never answers an audit (a refused body, a split panel, a lost callback), anyone can mark it
+    /// unanswered after two days so the asker knows the fee is spent and the target can be asked about again.
+    function reclaimAudit(bytes32 requestId) external {
+        Pending storage p = pending[requestId];
+        if (p.kind != 3 || block.timestamp <= p.askedAt + 2 days) revert WrongStatus();
+        uint256 auditId = p.id;
+        delete pending[requestId];
+        Audit storage au = _audits[auditId];
+        au.finding = Finding.NoAnswer;
+        if (auditOf[au.chainId][au.target] == Finding.Asked) auditOf[au.chainId][au.target] = Finding.None;
+        emit AuditUnanswered(auditId, requestId);
     }
 
     // ---------------------------------------------------------------- the answer
 
     /// Called by the Intake with the swarm's signed answer (selector 0x510379c7). It gets 200,000 gas, once.
-    function onOracleResult(bytes32 requestId, OracleAttestation.Attestation calldata a, bytes calldata signature) external {
+    function onOracleResult(bytes32 requestId, OracleAttestation.Attestation calldata a, bytes calldata signature)
+        external
+    {
         if (msg.sender != address(intake)) revert NotIntake();
-        Pending memory p = pending[requestId];
-        if (p.kind == 0) revert UnknownRequest();
+        Pending storage p = pending[requestId];
+        uint8 kind = p.kind;
+        uint256 id = p.id;
+        bytes32 questionHash = p.questionHash;
+        if (kind == 0) revert UnknownRequest();
         delete pending[requestId];
+        // the signature covers the question's hash: an answer to any other question is refused, whoever paired them
+        if (questionHash != bytes32(0) && a.questionHash != questionHash) revert BadAttestation();
         bool yes = _accept(a, signature);
-        if (p.kind == 1) {
-            Case storage c = _cases[p.id];
+        if (kind == 1) {
+            Case storage c = _cases[id];
             c.status = yes ? Status.Confirmed : Status.Rejected;
             if (yes) {
                 flagged[c.suspect] = true;
                 compromised[c.wallet] = true;
             }
-            emit Verdict(p.id, yes, a.requestId, a.agreed, a.panelSize);
-        } else if (p.kind == 2) {
-            _settleLead(p.id, yes);
+            emit Verdict(id, yes, a.requestId, a.agreed, a.panelSize);
+        } else if (kind == 2) {
+            _settleLead(id, yes);
         } else {
-            Audit storage au = _audits[p.id];
+            Audit storage au = _audits[id];
             au.finding = yes ? Finding.CanTakeFunds : Finding.NoPowerFound;
             auditOf[au.chainId][au.target] = au.finding;
-            emit AuditResult(p.id, yes, a.agreed, a.panelSize);
+            emit AuditResult(id, yes, a.agreed, a.panelSize);
         }
     }
 
@@ -326,16 +433,55 @@ contract LastSeenRegistry is EIP712, Ownable {
             c.bounty -= paid;
             asset.safeTransfer(l.hunter, paid + s);
         } else {
-            if (l.kind == 1) _claimed[l.caseId][l.to] = false;
+            _release(leadId);
             h.checks += s; // a wrong lead pays for its own check
         }
         emit LeadVerdict(leadId, yes, paid);
     }
 
     function _accept(OracleAttestation.Attestation calldata a, bytes calldata signature) internal view returns (bool) {
-        address signer = ECDSA.recover(_hashTypedDataV4(OracleAttestation.hash(a)), signature);
-        if (signer != attester || a.answerType != 0 || a.agreed < a.quorum || a.panelSize < panelSize || block.timestamp > a.expiresAt) revert BadAttestation();
+        address signer = _recover(attestationDigest(a), signature);
+        if (
+            signer != attester || a.answerType != 0 || a.agreed < a.quorum || a.panelSize < panelSize
+                || block.timestamp > a.expiresAt
+        ) revert BadAttestation();
         return abi.decode(a.answer, (bool));
+    }
+
+    /// A 65-byte r‖s‖v signature, as the oracle's signer produces. A malleated copy recovers the same signer and
+    /// cannot replay: the pending id is deleted before the signature is checked.
+    function _recover(bytes32 digest, bytes calldata sig) internal pure returns (address who) {
+        if (sig.length != 65) revert BadAttestation();
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(sig.offset)
+            s := calldataload(add(sig.offset, 32))
+            v := byte(0, calldataload(add(sig.offset, 64)))
+        }
+        who = ecrecover(digest, v, r, s);
+        if (who == address(0)) revert BadAttestation();
+    }
+
+    /// The EIP-712 digest the oracle signs for this contract: domain "IdentityMD Oracle" version "2", this chain, this address.
+    function attestationDigest(OracleAttestation.Attestation calldata a) public view returns (bytes32) {
+        bytes32 domain = keccak256(abi.encode(DOMAIN_TYPEHASH, NAME_HASH, VERSION_HASH, block.chainid, address(this)));
+        return keccak256(abi.encodePacked("\x19\x01", domain, _structHash(a)));
+    }
+
+    /// EIP-712 hashStruct of the attestation: the type hash, then the 15 fields as the ABI already lays them out in
+    /// calldata (every one a static word, `answer` as an offset), with the `answer` word replaced by keccak256(answer).
+    function _structHash(OracleAttestation.Attestation calldata a) internal pure returns (bytes32 h) {
+        bytes32 answerHash = keccak256(a.answer);
+        bytes32 typehash = OracleAttestation.TYPEHASH;
+        assembly ("memory-safe") {
+            let p := mload(0x40)
+            mstore(p, typehash)
+            calldatacopy(add(p, 32), a, 480)
+            mstore(add(p, 160), answerHash)
+            h := keccak256(p, 512)
+        }
     }
 
     // ---------------------------------------------------------------- the pool
@@ -355,97 +501,70 @@ contract LastSeenRegistry is EIP712, Ownable {
         return false;
     }
 
-    function _ask(bytes memory body) internal returns (bytes32) {
-        asset.forceApprove(address(intake), price);
-        return intake.request(action, body, IIntake.Callback(address(this), this.onOracleResult.selector), address(asset), price);
+    function _question(
+        uint8 kind,
+        address a,
+        address b,
+        uint64 chainId,
+        uint64 fromBlock,
+        uint64 toBlock,
+        string memory url
+    ) internal view returns (bytes memory, bytes32) {
+        return questions.build(kind, a, b, chainId, fromBlock, toBlock, panelSize, quorum, url);
     }
 
-    // ---------------------------------------------------------------- the questions, as the swarm reads them
-
-    function _panel() internal view returns (bytes memory) {
-        return abi.encodePacked('"answerType":"bool","panelSize":', uint256(panelSize).toString(), ',"quorum":', uint256(quorum).toString(), ',"validForSeconds":86400');
-    }
-
-    function _window(Case storage c) internal view returns (bytes memory) {
-        return abi.encodePacked(
-            '"chainId":', uint256(c.chainId).toString(), ',"window":{"fromBlock":', uint256(c.fromBlock).toString(), ',"toBlock":', uint256(c.toBlock).toString(),
-            '},"evidence":"chain",', _panel()
+    function _ask(uint8 kind, uint256 id, bytes memory body, bytes32 questionHash)
+        internal
+        returns (bytes32 requestId)
+    {
+        if (!asset.approve(address(intake), price)) revert BadInput();
+        requestId = intake.request(
+            action, body, IIntake.Callback(address(this), this.onOracleResult.selector), address(asset), price
         );
-    }
-
-    function _verdictBody(Case storage c) internal view returns (bytes memory) {
-        string memory w = c.wallet.toHexString();
-        string memory s = c.suspect.toHexString();
-        return abi.encodePacked(
-            '{"v":1,"question":"Within the window, did address ', s, ' take tokens or native coin out of wallet ', w,
-            ' using transactions that ', s, ' sent itself? Count a transfer out of ', w, ' when the transaction sender is ', s,
-            ', including EIP-7702 transactions that run code as ', w, '. Answer true if there is at least one.",',
-            _window(c),
-            ',"definitions":{"take":"A token transfer event or native coin movement from ', w, ' to any address, inside a transaction whose sender (tx.from) is ', s,
-            '.","not counted":"Transactions that ', w, ' itself signed and sent."}}'
-        );
-    }
-
-    function _leadBody(Case storage c, address from, address to) internal view returns (bytes memory) {
-        return abi.encodePacked(
-            '{"v":1,"question":"Within the window, did address ', from.toHexString(), ' send tokens or native coin to address ', to.toHexString(),
-            '? Answer true if there is at least one such transfer.",',
-            _window(c),
-            ',"definitions":{"send":"A token transfer event or native coin movement whose sender is the first address and whose receiver is the second."}}'
-        );
-    }
-
-    function _linkBody(Case storage c, string calldata url) internal view returns (bytes memory) {
-        string memory s = c.suspect.toHexString();
-        return abi.encodePacked(
-            '{"v":1,"question":"Does the public page at ', url, ' show evidence that ties address ', s,
-            ' to a specific online account, exchange account, service or person? Address ', s, ' took funds from wallet ', c.wallet.toHexString(),
-            '. Answer true only if the page itself shows that link.","chainId":', uint256(c.chainId).toString(),
-            ',"window":{"hours":24},"evidence":"panel",', _panel(),
-            // the hunter's page is unknown to the wording screen, so the reading is pinned in definitions and the screen skipped
-            ',"definitions":{"ties":"The page shows the address together with an account name, handle, deposit record or other identifier, in a way a reader can check.","missing":"If the page cannot be opened, report inability rather than guessing."},"guards":{"sources":["',
-            url, '"],"minSources":1},"allowAmbiguous":true}'
-        );
-    }
-
-    function _auditBody(uint64 chainId, address target) internal view returns (bytes memory) {
-        string memory t = target.toHexString();
-        string memory id = uint256(chainId).toString();
-        return abi.encodePacked(
-            '{"v":1,"question":"Can a single privileged account (an owner, an admin, or a hard-coded address) use the contract at ', t, ' on chain ', id,
-            ' to move tokens or native coin that users deposited in it or approved to it, to an address of its choosing, without that user signing for the move? Read the contract\'s verified source code. Answer true if yes.","chainId":', id,
-            ',"window":{"hours":24},"evidence":"panel",', _panel(),
-            ',"definitions":{"source":"The verified source on Sourcify: https://sourcify.dev/server/v2/contract/', id, '/', t,
-            '?fields=sources . Include code reached through a proxy or delegatecall.","privileged":"Any role or address ordinary users do not hold, including an upgrade admin who can replace the code.","missing":"If no verified source exists, report inability rather than guessing."},"guards":{"sources":["https://sourcify.dev/","https://repo.sourcify.dev/"],"minSources":1}}'
-        );
-    }
-
-    /// https:// followed by 4 to 292 printable characters, none of which could break the JSON the swarm reads.
-    function _safeUrl(bytes calldata u) internal pure returns (bool) {
-        if (u.length < 12 || u.length > 300) return false;
-        bytes8 head = bytes8(u[:8]);
-        if (head != bytes8("https://")) return false;
-        for (uint256 i = 8; i < u.length; i++) {
-            bytes1 ch = u[i];
-            if (ch <= 0x20 || ch >= 0x7f || ch == '"' || ch == "\\") return false;
-        }
-        return true;
+        pending[requestId] = Pending(kind, uint64(block.timestamp), id, questionHash);
     }
 
     // ---------------------------------------------------------------- reading
 
-    function caseCount() external view returns (uint256) { return _cases.length; }
-    function leadCount() external view returns (uint256) { return _leads.length; }
-    function auditCount() external view returns (uint256) { return _audits.length; }
-    function getCase(uint256 id) external view returns (Case memory) { return _cases[id]; }
-    function getLead(uint256 id) external view returns (Lead memory) { return _leads[id]; }
-    function getAudit(uint256 id) external view returns (Audit memory) { return _audits[id]; }
-    function verdictBody(uint256 caseId) external view returns (string memory) { return string(_verdictBody(_cases[caseId])); }
-    function auditBody(uint64 chainId, address target) external view returns (string memory) { return string(_auditBody(chainId, target)); }
+    function counts() external view returns (uint256 cases, uint256 leads, uint256 audits) {
+        return (_cases.length, _leads.length, _audits.length);
+    }
+
+    function getCase(uint256 id)
+        external
+        view
+        returns (
+            address wallet,
+            address suspect,
+            address opener,
+            uint64 chainId,
+            uint64 fromBlock,
+            uint64 toBlock,
+            uint64 askedAt,
+            Status status,
+            uint256 bounty
+        )
+    {
+        Case storage c = _cases[id];
+        return (c.wallet, c.suspect, c.opener, c.chainId, c.fromBlock, c.toBlock, c.askedAt, c.status, c.bounty);
+    }
 
     // ---------------------------------------------------------------- owner settings
 
-    function setOracle(IIntake intake_, bytes32 action_, IERC20 asset_, uint256 price_, address attester_) external onlyOwner {
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    function transferOwnership(address to) external onlyOwner {
+        emit OwnershipTransferred(owner, to);
+        owner = to;
+    }
+
+    function setOracle(IIntake intake_, bytes32 action_, IERC20 asset_, uint256 price_, address attester_)
+        external
+        onlyOwner
+    {
         // donated, bounty and prepaid IMD stay in the old token, so the token itself can only change while the contract holds none
         if (address(asset_) != address(asset) && asset.balanceOf(address(this)) != 0) revert BadInput();
         intake = intake_;

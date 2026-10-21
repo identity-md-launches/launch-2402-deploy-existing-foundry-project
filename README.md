@@ -33,7 +33,8 @@ LastSeenIMD (https://lastseen-4pu.pages.dev) finds stolen keys, sweepers and dra
 - A hop already confirmed or waiting cannot be submitted again, and a page can be submitted once per case, so nobody is paid twice for the same lead.
 - A link must be `https://` with printable characters only and no quotes or backslashes, so it cannot change the question the swarm reads.
 - Only the hirer can pay private tips or close the bounty, and only after its end date with no lead waiting.
-- The owner can update the oracle settings and the audit fee (IdentityMD versions its settings), but cannot change the token while the contract holds any, and has no way to withdraw the pool, rewards, prepaid checks or stakes.
+- The owner can update the oracle settings and the audit fee (IdentityMD versions its settings), but cannot change the token while the contract holds any, and has no function that withdraws the pool, rewards, prepaid checks or stakes. Trust assumption: whoever holds the owner key chooses which oracle signer's answers count, and with that every verdict, lead payout and audit finding; keep it on a multisig.
+- A case verdict and an on-chain hop pin their question: the registry stores the oracle's `questionHash` when it asks and refuses an answer signed for any other question. A case asked again after a day drops its earlier request. Private tips cannot be paid while a lead is waiting, a hunt cannot be funded after its end date, and an audit nobody answered can be marked so after two days (`reclaimAudit`).
 
 ## Tests
 
@@ -41,7 +42,7 @@ LastSeenIMD (https://lastseen-4pu.pages.dev) finds stolen keys, sweepers and dra
 forge test
 ```
 
-20 tests run against a mock Intake that gives each callback 200,000 gas, as IdentityMD does: confirmed and rejected verdicts, forged signatures, signatures made for another contract, panels below quorum, calls not from the Intake, replays, the free pool, the hop-by-hop hunt paid from prepaid checks, a wrong lead paying for its own check, double claims, page leads, unsafe links, tips and closing by the hirer only, stakes returned when the swarm never answers, the paid audit feeding the pool, and the callback selector `0x510379c7`. `Bodies.t.sol` prints the exact questions.
+35 tests run against a mock Intake that gives each callback 200,000 gas, as IdentityMD does: confirmed and rejected verdicts, forged signatures, signatures made for another contract, panels below quorum, calls not from the Intake, replays, the free pool, the hop-by-hop hunt paid from prepaid checks, a wrong lead paying for its own check, double claims, page leads, unsafe links, tips and closing by the hirer only, stakes returned when the swarm never answers, the paid audit feeding the pool, and the callback selector `0x510379c7`. `Adaptation.t.sol` covers the launch changes (EIP-170 size, owner from the constructor, pinned question hashes, the retry, tip, funding, page-lead and audit fixes) and reproduces the oracle's published signature vector. `Bodies.t.sol` prints the exact questions; the question texts live in `src/LastSeenQuestions.sol`, which the registry creates and reads so its own runtime stays under EIP-170 without the optimizer. See `ADAPTATION.md` for every change made for the launch.
 
 Every question was run through IdentityMD's free `POST /requests/check`: the case verdict on 14 Oct 2026 and the page lead and the audit on 21 Oct 2026, with no wording blockers.
 
