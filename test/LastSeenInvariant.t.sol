@@ -155,30 +155,54 @@ contract RegistryHandler is Test {
         ghostRewardIn += reward;
     }
 
-    /// The case's opener takes the seat from a stranger, or the victim's wallet from anyone; the new hirer tops up.
-    function takeSeat(uint256 caseSeed, bool byWallet, uint256 reward, uint16 days_) external {
+    /// The case's opener or its wallet takes the seat from a stranger, never from each other and never under a
+    /// waiting lead. The earlier hirer is paid back what was left; the new hirer starts from their own deposit.
+    function takeSeat(uint256 caseSeed, bool byWallet, uint256 reward, uint16 checks, uint16 days_) external {
         uint256 n = cases();
         if (n == 0) return;
         uint256 id = caseSeed % n;
-        (address hirer,,,,) = reg.hunts(id);
+        (address hirer,, uint256 inFlight,,) = reg.hunts(id);
         (address wallet,, address opener,,,,, LastSeenRegistry.Status s,) = reg.getCase(id);
         if (hirer == address(0) || s == LastSeenRegistry.Status.Rejected) return;
         address taker = byWallet ? wallet : opener;
-        if (taker == hirer || (!byWallet && hirer == wallet)) {
-            if (taker != hirer) {
-                vm.prank(taker);
-                vm.expectRevert(LastSeenRegistry.NotHirer.selector);
-                reg.postBounty(id, 0, 0, bytes32(0), 7);
-            }
+        if (taker == hirer) return;
+        if (hirer == opener || hirer == wallet) {
+            vm.prank(taker);
+            vm.expectRevert(LastSeenRegistry.NotHirer.selector);
+            reg.postBounty(id, 1 ether, 1, bytes32(0), 7);
             return;
         }
-        reward = bound(reward, 0, 20 ether);
-        days_ = uint16(bound(days_, 7, 120));
+        if (inFlight != 0) {
+            vm.prank(taker);
+            vm.expectRevert(LastSeenRegistry.WrongStatus.selector);
+            reg.postBounty(id, 1 ether, 1, bytes32(0), 7);
+            return;
+        }
+        // a takeover with no check of the taker's own is refused, and nothing moves
         vm.prank(taker);
-        reg.postBounty(id, reward, 0, bytes32("taken"), days_);
-        (address now_,,,, bytes32 key) = reg.hunts(id);
+        vm.expectRevert(LastSeenRegistry.BadInput.selector);
+        reg.postBounty(id, 1 ether, 0, bytes32(0), 7);
+
+        _takeSeat(id, taker, bound(reward, 0, 20 ether), uint16(bound(checks, 1, 4)), uint16(bound(days_, 7, 120)));
+    }
+
+    function _takeSeat(uint256 id, address taker, uint256 reward, uint16 checks, uint16 days_) internal {
+        (address hirer,,, uint256 heldChecks,) = reg.hunts(id);
+        uint256 left = _bounty(id);
+        uint256 hirerBefore = imd.balanceOf(hirer);
+        uint256 takerBefore = imd.balanceOf(taker);
+        vm.prank(taker);
+        reg.postBounty(id, reward, checks, bytes32("taken"), days_);
+        // the earlier hirer gets exactly what was left; the taker pays exactly their own deposit
+        assertEq(imd.balanceOf(hirer) - hirerBefore, left + heldChecks);
+        assertEq(takerBefore - imd.balanceOf(taker), reward + uint256(checks) * PRICE);
+        (address now_, uint256 openUntil,, uint256 newChecks, bytes32 key) = reg.hunts(id);
         assertEq(now_, taker);
         assertEq(key, bytes32("taken"));
+        assertEq(newChecks, uint256(checks) * PRICE);
+        assertEq(_bounty(id), reward);
+        assertEq(openUntil, block.timestamp + uint256(days_) * 1 days); // restarted, not inherited
+        ghostRewardOut += left;
         ghostRewardIn += reward;
         seatsTaken++;
     }

@@ -626,6 +626,200 @@ contract LastSeenEdgesTest is LastSeenFixture {
         }
     }
 
+    // ---------------------------------------------------------------- the hirer's seat changing hands
+
+    address squatter = address(0x5A77);
+
+    /// A stranger hires first on a case this contract opened; returns the case.
+    function _squatted(uint256 reward, uint16 checks, uint16 days_) internal returns (uint256 id) {
+        id = _confirmed();
+        imd.mint(squatter, 100 ether);
+        vm.startPrank(squatter);
+        imd.approve(address(reg), type(uint256).max);
+        reg.postBounty(id, reward, checks, bytes32("squatter key"), days_);
+        vm.stopPrank();
+    }
+
+    /// The new hirer's hunt runs from their own post: a long window the stranger set is not inherited.
+    function test_takeoverRestartsTheWindowFromTheNewPost() public {
+        uint256 id = _squatted(1 ether, 1, 365);
+        vm.warp(block.timestamp + 3 days);
+        reg.postBounty(id, 0, 1, 0, 7);
+        (, uint256 openUntil,,,) = reg.hunts(id);
+        assertEq(openUntil, block.timestamp + 7 days);
+        vm.warp(block.timestamp + 7 days + 1);
+        vm.prank(hunter);
+        vm.expectRevert(LastSeenRegistry.WrongStatus.selector);
+        reg.submitLead(id, sweeper, deposit);
+    }
+
+    /// A stranger's hunt that ended unclosed can still be taken: they are paid what was left, leads open again.
+    function test_takeoverOfAnEndedHuntPaysTheStrangerAndReopens() public {
+        uint256 id = _squatted(3 ether, 2, 7);
+        vm.warp(block.timestamp + 8 days);
+        vm.prank(hunter);
+        vm.expectRevert(LastSeenRegistry.WrongStatus.selector);
+        reg.submitLead(id, sweeper, deposit);
+        reg.postBounty(id, 2 ether, 1, 0, 30);
+        assertEq(imd.balanceOf(squatter), 100 ether);
+        vm.prank(hunter);
+        reg.submitLead(id, sweeper, deposit);
+        assertEq(_inFlight(id), 1);
+    }
+
+    /// After the stranger closed their own hunt, a takeover pays them nothing more.
+    function test_takeoverAfterTheStrangerClosedPaysNothing() public {
+        uint256 id = _squatted(3 ether, 2, 7);
+        vm.warp(block.timestamp + 8 days);
+        vm.prank(squatter);
+        reg.closeBounty(id);
+        assertEq(imd.balanceOf(squatter), 100 ether);
+        vm.expectEmit(true, false, false, true, address(reg));
+        emit LastSeenRegistry.BountyClosed(id, 0);
+        reg.postBounty(id, 1 ether, 1, 0, 7);
+        assertEq(imd.balanceOf(squatter), 100 ether);
+        assertEq(imd.balanceOf(address(reg)), 1 ether + PRICE);
+    }
+
+    /// The outgoing hirer gets back what closeBounty would pay: donations and wrong leads' stakes included.
+    function test_takeoverPaysBackDonationsAndWrongStakes() public {
+        uint256 id = _squatted(2 ether, 2, 30);
+        vm.prank(hunter);
+        reg.fundBounty(id, 1 ether);
+        vm.prank(hunter);
+        (, bytes32 r) = reg.submitLead(id, sweeper, deposit);
+        _deliver(r, false); // the wrong lead's stake becomes a check
+        assertEq(_checks(id), 2 * PRICE);
+        vm.expectEmit(true, false, false, true, address(reg));
+        emit LastSeenRegistry.BountyClosed(id, 3 ether + 2 * PRICE);
+        reg.postBounty(id, 0, 1, 0, 7);
+        assertEq(imd.balanceOf(squatter), 100 ether - 2 ether - 2 * PRICE + 3 ether + 2 * PRICE);
+        assertEq(imd.balanceOf(address(reg)), PRICE);
+        assertEq(_bounty(id), 0);
+    }
+
+    /// The outgoing hirer keeps none of the hirer's powers.
+    function test_outgoingHirerLosesTipCloseAndReclaimPowers() public {
+        uint256 id = _squatted(2 ether, 2, 7);
+        reg.postBounty(id, 4 ether, 2, 0, 7);
+        vm.prank(hunter);
+        (uint256 lead,) = reg.submitLead(id, sweeper, deposit);
+        vm.warp(block.timestamp + 8 days);
+        vm.startPrank(squatter);
+        vm.expectRevert(LastSeenRegistry.NotHirer.selector);
+        reg.payTip(id, bytes32("tip"), squatter, 1 ether);
+        vm.expectRevert(LastSeenRegistry.NotHirer.selector);
+        reg.closeBounty(id);
+        vm.expectRevert(LastSeenRegistry.NotHirer.selector);
+        reg.reclaimStake(lead);
+        vm.stopPrank();
+        reg.reclaimStake(lead); // the new hirer can
+        assertEq(imd.balanceOf(hunter), 10 ether);
+    }
+
+    /// A takeover that fails for any reason moves nothing: the stranger keeps the seat and their deposit.
+    function test_failedTakeoverMovesNothing() public {
+        uint256 id = _squatted(2 ether, 2, 30);
+        uint256 held = imd.balanceOf(address(reg));
+        vm.expectRevert(LastSeenRegistry.BadInput.selector);
+        reg.postBounty(id, 1 ether, 0, 0, 30); // no check of the taker's own
+        vm.expectRevert(LastSeenRegistry.BadInput.selector);
+        reg.postBounty(id, 1 ether, 1, 0, 6); // days below the floor
+        vm.expectRevert(LastSeenRegistry.BadInput.selector);
+        reg.postBounty(id, 1 ether, 1, 0, 366);
+        imd.approve(address(reg), 0);
+        vm.expectRevert(); // the taker cannot pay
+        reg.postBounty(id, 1 ether, 1, 0, 30);
+        (address hirer,,, uint256 checks, bytes32 key) = reg.hunts(id);
+        assertEq(hirer, squatter);
+        assertEq(checks, 2 * PRICE);
+        assertEq(key, bytes32("squatter key"));
+        assertEq(_bounty(id), 2 ether);
+        assertEq(imd.balanceOf(address(reg)), held);
+        assertEq(imd.balanceOf(squatter), 100 ether - 2 ether - 2 * PRICE);
+    }
+
+    /// Once the swarm rejects the case, nobody takes the seat; the stranger closes and gets everything back.
+    function test_noTakeoverOnARejectedCase() public {
+        uint256 id = _open();
+        bytes32 req = reg.requestVerdict(id);
+        imd.mint(squatter, 100 ether);
+        vm.startPrank(squatter);
+        imd.approve(address(reg), type(uint256).max);
+        reg.postBounty(id, 2 ether, 1, 0, 30);
+        vm.stopPrank();
+        _deliver(req, false);
+        vm.expectRevert(LastSeenRegistry.WrongStatus.selector);
+        reg.postBounty(id, 1 ether, 1, 0, 30);
+        vm.prank(squatter);
+        reg.closeBounty(id);
+        assertEq(imd.balanceOf(squatter), 100 ether);
+    }
+
+    /// Whatever both hirers deposit, the takeover pays the stranger exactly what was left and the registry then holds
+    /// exactly the new hirer's deposit.
+    /// forge-config: default.fuzz.runs = 500
+    function testFuzz_takeoverConservesFunds(uint96 reward1, uint8 checks1, uint96 gift, uint96 reward2, uint8 checks2)
+        public
+    {
+        uint256 r1 = bound(reward1, 0, 40 ether);
+        uint16 c1 = uint16(bound(checks1, 1, 20));
+        uint256 g = bound(gift, 0, 5 ether);
+        uint256 r2 = bound(reward2, 0, 500 ether);
+        uint16 c2 = uint16(bound(checks2, 1, 50));
+        uint256 id = _squatted(r1, c1, 30);
+        if (g > 0) {
+            imd.mint(address(0x6A), g);
+            vm.startPrank(address(0x6A));
+            imd.approve(address(reg), g);
+            reg.fundBounty(id, g);
+            vm.stopPrank();
+        }
+        uint256 mine = imd.balanceOf(address(this));
+        reg.postBounty(id, r2, c2, bytes32("k"), 7);
+        assertEq(imd.balanceOf(squatter), 100 ether + g);
+        assertEq(mine - imd.balanceOf(address(this)), r2 + uint256(c2) * PRICE);
+        assertEq(imd.balanceOf(address(reg)), r2 + uint256(c2) * PRICE);
+        assertEq(_bounty(id), r2);
+        assertEq(_checks(id), uint256(c2) * PRICE);
+    }
+
+    // ---------------------------------------------------------------- page keys
+
+    /// The normalisations stop at their boundaries: `www.` only at the start of the host, `:443` only as the whole
+    /// port, case folding only in the scheme and host.
+    function test_pageKeyNormalisesOnlyWhereItSays() public {
+        LastSeenQuestions q = new LastSeenQuestions();
+        bytes32 p = q.pageKey("https://x.com/a");
+        assertEq(q.pageKey("HTTPS://X.COM/a"), p);
+        assertEq(q.pageKey("https://wWw.x.com/a///?b#c"), p);
+        assertTrue(q.pageKey("https://www2.x.com/a") != p);
+        assertTrue(q.pageKey("https://m.www.x.com/a") != p);
+        assertTrue(q.pageKey("https://x.com:4430/a") != p);
+        assertTrue(q.pageKey("https://x.com:44/a") != p);
+        assertTrue(q.pageKey("https://x.com/a:443") != p); // ":443" in a path is part of the path
+        assertTrue(q.pageKey("https://x.com/A") != p);
+        assertTrue(q.pageKey("https://x.com/a/b") != p);
+        assertEq(q.pageKey("https://www.x.com"), q.pageKey("https://x.com:443/"));
+    }
+
+    /// For any path, the trailing slash, a fragment, a query, `www.`, `:443` and host case lead to one key.
+    /// forge-config: default.fuzz.runs = 500
+    function testFuzz_pageKeyVariantsShareOneKey(uint256 seed, uint8 len) public {
+        LastSeenQuestions q = new LastSeenQuestions();
+        uint256 n = bound(len, 1, 60);
+        bytes memory path = new bytes(n);
+        for (uint256 i; i < n; i++) {
+            uint8 c = uint8(uint256(keccak256(abi.encode(seed, i))) % 62);
+            path[i] = bytes1(c < 10 ? 0x30 + c : c < 36 ? 0x41 + c - 10 : 0x61 + c - 36); // [0-9A-Za-z]
+        }
+        bytes32 p = q.pageKey(string.concat("https://x.com/", string(path)));
+        assertEq(q.pageKey(string.concat("https://WWW.X.Com:443/", string(path), "/")), p);
+        assertEq(q.pageKey(string.concat("https://x.com//", string(path), "#", string(path))), p);
+        assertEq(q.pageKey(string.concat("https://x.com/", string(path), "?", string(path))), p);
+        assertTrue(q.pageKey(string.concat("https://x.com/", string(path), "z")) != p);
+    }
+
     // ---------------------------------------------------------------- leads
 
     function test_submitLeadFailurePaths() public {
